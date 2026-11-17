@@ -195,6 +195,7 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
                 context.pop("awaiting_field", None)
             elif context.get("budget_max_pkr") is not None:
                 context["awaiting_field"] = "budget"
+                context["budget_no_match"] = True
     elif action["action"] == "answer":
         action["products"] = catalogue_matches(context)
     handoff = action["action"] == "human_handoff"

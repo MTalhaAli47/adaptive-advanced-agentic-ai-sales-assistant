@@ -28,9 +28,10 @@ class LocalFallbackProvider:
             category = next_action.get("product_category", "that category")
             if category == "cars":
                 return "I don’t currently have cars in the product catalogue, so I can’t confirm a car or its features. If you want a salesperson to check, reply ‘salesperson’."
+            label = {"laptops": "laptop", "solar": "solar assessment", "software": "software plan"}.get(category, category)
             low = next_action.get("lowest_price_pkr")
             if low:
-                return f"I couldn’t find a {category} option in that budget. Current catalogue options start at PKR {low:,}. Would you like to see them or adjust your budget?"
+                return f"I couldn’t find a {label} within that budget. Current catalogue options start at PKR {int(low):,}. Reply ‘show options’ to see them without a budget filter, or send a new budget."
             return f"I couldn’t find any {category} products in the current catalogue. If you want a salesperson to check, reply ‘salesperson’."
         if action == "qualify":
             return next_action.get("question", "Could you tell me a little more about what you need?")

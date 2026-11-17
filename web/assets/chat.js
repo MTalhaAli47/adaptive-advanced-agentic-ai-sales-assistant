@@ -31,7 +31,7 @@ async function setupChat(form, box) {
   if (saved) {
     try {
       const history = await fetch(`${API}/conversations/${encodeURIComponent(saved)}`).then(r => r.json());
-      if (history.messages.length) {
+      if (getCustomer() === saved && history.messages.length) {
         box.replaceChildren();
         history.messages.forEach(message => addBubble(box, message.role === 'customer' ? 'customer' : 'assistant', message.content));
       }
@@ -68,6 +68,14 @@ document.addEventListener('DOMContentLoaded', () => {
   if (box && form) {
     addBubble(box, 'assistant', 'Hello! Tell me what you are looking for and I’ll help you find the next step.');
     setupChat(form, box);
+    const newChat = document.querySelector('#new-chat');
+    if (newChat) {
+      newChat.addEventListener('click', () => {
+        localStorage.removeItem('aisa_customer_id');
+        box.replaceChildren();
+        addBubble(box, 'assistant', 'New conversation started. What are you looking for today?');
+      });
+    }
   }
 
   const toggle = document.querySelector('#widget-toggle');
@@ -84,5 +92,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     const close = document.querySelector('#widget-close');
     if (close) close.addEventListener('click', () => { widget.hidden = true; });
+    const widgetNewChat = document.querySelector('#widget-new-chat');
+    if (widgetNewChat) {
+      widgetNewChat.addEventListener('click', () => {
+        localStorage.removeItem('aisa_customer_id');
+        const widgetBox = widget.querySelector('.chat-box');
+        widgetBox.replaceChildren();
+        addBubble(widgetBox, 'assistant', 'New conversation started. What are you looking for today?');
+      });
+    }
   }
 });

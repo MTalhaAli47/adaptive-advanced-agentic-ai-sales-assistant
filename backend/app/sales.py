@@ -34,7 +34,8 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     lowered = text.casefold()
     prior_category = context.get("product_category")
     detected_category = _category(lowered)
-    if detected_category and detected_category != prior_category:
+    starts_new_search = bool(re.search(r"\b(i need|i want|looking for|search for|start over|new search)\b", lowered))
+    if detected_category and (detected_category != prior_category or starts_new_search):
         context["product_category"] = detected_category
         context.pop("use_case", None)
         context.pop("budget_min_pkr", None)
@@ -44,6 +45,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("budget_needs_clarification", None)
         context.pop("budget_clarification_count", None)
         context.pop("budget_prompt_skipped", None)
+        context.pop("budget_no_match", None)
         context.pop("gpu_model", None)
         context.pop("minimum_ram_gb", None)
         context.pop("minimum_vram_gb", None)
@@ -68,7 +70,8 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", text, flags=re.IGNORECASE)
     amounts = [(_amount(match.group(1), match.group(2)), match.group(0)) for match in AMOUNT_RE.finditer(budget_text)]
     budget_requested = context.get("awaiting_field") == "budget"
-    has_budget_marker = any(term in lowered for term in ("budget", "under", "below", "less than", "up to", "within", "around", "between", "price", "cost"))
+    budget_no_match = context.get("budget_no_match", False)
+    has_budget_marker = any(term in lowered for term in ("budget", "under", "below", "less than", "up to", "within", "around", "between", "price", "cost", "pkr", "rupee", "rs."))
     has_explicit_unit = any(match.group(2) for match in AMOUNT_RE.finditer(budget_text))
     gpu_query = bool(re.search(r"\b(rtx|gpu|vram|graphics card)\b", lowered))
     if amounts and (has_budget_marker or has_explicit_unit or len(amounts) > 1 or (budget_requested and not gpu_query)):
@@ -79,6 +82,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context["budget_flexible"] = False
         context.pop("budget_needs_clarification", None)
         context.pop("budget_clarification_count", None)
+        context.pop("budget_no_match", None)
         context.pop("awaiting_field", None)
     elif budget_requested and re.search(r"\b(no|any|flexible|no limit)\b", lowered):
         context["budget_flexible"] = True
@@ -91,6 +95,13 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context["budget_text"] = "Budget skipped"
         context.pop("budget_needs_clarification", None)
         context.pop("budget_clarification_count", None)
+        context.pop("awaiting_field", None)
+    elif budget_no_match and re.search(r"\b(show|see|yes|sure|options|them)\b", lowered):
+        context.pop("budget_min_pkr", None)
+        context.pop("budget_max_pkr", None)
+        context["budget_flexible"] = True
+        context["budget_prompt_skipped"] = True
+        context.pop("budget_no_match", None)
         context.pop("awaiting_field", None)
     elif budget_requested and re.fullmatch(r"\s*(yes|yeah|yep|ok|okay)\s*[.!]?\s*", lowered):
         clarification_count = context.get("budget_clarification_count", 0) + 1
@@ -145,7 +156,7 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
     if context.get("awaiting_field") == "budget" and context.get("budget_needs_clarification"):
         attempt = context.get("budget_clarification_count", 1)
         prompt = (
-            "I need a number to filter by budget. Type a range like 300,000–500,000, say ‘no fixed budget’, or type ‘skip’."
+            "I still need a number to filter by budget. Type a range like 300,000–500,000, say ‘no fixed budget’, or type ‘skip’."
             if attempt > 1 else
             "Please give an approximate amount in PKR, such as 100,000–300,000, or say ‘no fixed budget’."
         )
