@@ -11,6 +11,7 @@ Updated 17 November 2026. This status reflects the files in this workspace, not 
 - Appointment request persistence and basic order intent records that remain pending approval; no payment processing.
 - Local no-key response provider and an isolated provider interface.
 - Gemini Flash-Lite adapter using the official Google GenAI SDK, with a local fallback on API errors.
+- Conversation state retains the active product category, parses PKR budgets, and matches catalogue laptops by category, GPU, RAM, VRAM, and price. Legacy conversations are backfilled from recent message history.
 
 ## Still planned or unverified
 

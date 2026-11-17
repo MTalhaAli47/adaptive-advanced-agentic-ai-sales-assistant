@@ -63,7 +63,13 @@ def initialize_database() -> None:
                 category TEXT NOT NULL,
                 price REAL,
                 currency TEXT NOT NULL DEFAULT 'PKR',
-                active INTEGER NOT NULL DEFAULT 1
+                active INTEGER NOT NULL DEFAULT 1,
+                brand TEXT,
+                ram_gb INTEGER,
+                gpu_model TEXT,
+                vram_gb INTEGER,
+                storage_gb INTEGER,
+                condition TEXT
             );
             CREATE TABLE IF NOT EXISTS appointments (
                 id TEXT PRIMARY KEY,
@@ -83,6 +89,13 @@ def initialize_database() -> None:
             );
             """
         )
+        existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
+        for column, definition in (
+            ("brand", "TEXT"), ("ram_gb", "INTEGER"), ("gpu_model", "TEXT"),
+            ("vram_gb", "INTEGER"), ("storage_gb", "INTEGER"), ("condition", "TEXT"),
+        ):
+            if column not in existing_columns:
+                db.execute(f"ALTER TABLE products ADD COLUMN {column} {definition}")
         db.executemany(
             "INSERT OR IGNORE INTO products(id,name,description,category,price,currency) VALUES(?,?,?,?,?,?)",
             [
@@ -97,6 +110,19 @@ def initialize_database() -> None:
                 ("hp-840g5-i5-8350u", "Used HP EliteBook 840 G5 — Core i5, 8GB, 256GB", "Used office laptop for everyday office work and light tasks. Intel Core i5-8350U, 8GB RAM, 256GB SSD. Used-unit condition and battery health should be checked. Sample Pakistan market price.", "Office Laptops", 58500, "PKR"),
                 ("hp-840g5-i5-8250u", "Used HP EliteBook 840 G5 — Core i5, 8GB, 256GB SSD", "Used office laptop for everyday office work and light tasks. Intel Core i5-8250U, 8GB RAM, 256GB SSD. Used-unit condition and battery health should be checked. Sample Pakistan market price.", "Office Laptops", 61000, "PKR"),
                 ("hp-840g5-i7-8650u", "Used HP EliteBook 840 G5 — Core i7, 16GB, 512GB SSD", "Used office laptop for everyday office work and light tasks. Intel Core i7-8650U, 16GB RAM, 512GB SSD. Used-unit condition and battery health should be checked. Sample Pakistan market price.", "Office Laptops", 78000, "PKR"),
+            ],
+        )
+        db.executemany(
+            "UPDATE products SET brand=?,ram_gb=?,gpu_model=?,vram_gb=?,storage_gb=?,condition=? WHERE id=?",
+            [
+                ("Lenovo", 32, "RTX 5060", 8, 512, "new; sample listing", "lenovo-rtx5060-32gb"),
+                ("Lenovo", 32, "RTX 5070", 8, 1024, "new; sample listing", "lenovo-rtx5070-32gb"),
+                ("Lenovo", 32, "RTX 5070 Ti", 12, 2048, "new; sample listing", "lenovo-rtx5070ti-32gb"),
+                ("Lenovo", 32, "RTX 5080", 16, 1024, "new; sample listing", "lenovo-rtx5080-32gb"),
+                ("Lenovo", 32, "RTX 5090", 24, 2048, "new; sample listing", "lenovo-rtx5090-32gb"),
+                ("HP", 8, None, None, 256, "used; verify unit condition", "hp-840g5-i5-8350u"),
+                ("HP", 8, None, None, 256, "used; verify unit condition", "hp-840g5-i5-8250u"),
+                ("HP", 16, None, None, 512, "used; verify unit condition", "hp-840g5-i7-8650u"),
             ],
         )
 

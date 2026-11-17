@@ -61,6 +61,63 @@ def get_customer_row(customer_id: str):
     return row
 
 
+def catalogue_matches(context: dict) -> list[dict]:
+    category = context.get("product_category")
+    use_case = (context.get("use_case") or "").casefold()
+    if category == "laptops":
+        if "office" in use_case:
+            category_filter = "category = 'Office Laptops'"
+        elif "gaming" in use_case or "3d" in use_case or "ai" in use_case:
+            category_filter = "category = 'Gaming Laptops'"
+        else:
+            category_filter = "category IN ('Gaming Laptops','Office Laptops')"
+    else:
+        category_filter = "category LIKE ?"
+
+    query = f"SELECT id,name,description,category,price,currency,brand,ram_gb,gpu_model,vram_gb,storage_gb,condition FROM products WHERE active=1 AND {category_filter}"
+    params: list = [] if category == "laptops" else [f"%{category or ''}%"]
+    minimum = context.get("budget_min_pkr")
+    maximum = context.get("budget_max_pkr")
+    gpu_model = context.get("gpu_model")
+    if gpu_model:
+        query += " AND gpu_model = ?"
+        params.append(gpu_model)
+    if context.get("minimum_ram_gb") is not None:
+        query += " AND ram_gb >= ?"
+        params.append(context["minimum_ram_gb"])
+    if context.get("minimum_vram_gb") is not None:
+        query += " AND vram_gb >= ?"
+        params.append(context["minimum_vram_gb"])
+    if minimum is not None:
+        query += " AND price >= ?"
+        params.append(minimum)
+    if maximum is not None:
+        query += " AND price <= ?"
+        params.append(maximum)
+    query += " ORDER BY price ASC LIMIT 5"
+    with connect() as db:
+        return [dict(row) for row in db.execute(query, params).fetchall()]
+
+
+def restore_conversation_context(customer_id: str, context: dict) -> dict:
+    """Backfill category/state for conversations created before the state parser."""
+    if context.get("product_category"):
+        return context
+    with connect() as db:
+        rows = db.execute(
+            "SELECT role,content FROM messages WHERE customer_id=? ORDER BY created_at DESC LIMIT 30",
+            (customer_id,),
+        ).fetchall()
+    rows = list(reversed(rows))
+    for item in rows:
+        if item["role"] == "customer":
+            extract_context(item["content"], context)
+    last_assistant = next((item["content"] for item in reversed(rows) if item["role"] == "assistant"), "")
+    if "budget" in last_assistant.casefold() and not context.get("budget_max_pkr"):
+        context["awaiting_field"] = "budget"
+    return context
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "environment": settings.environment}
@@ -115,27 +172,41 @@ def dashboard_summary() -> dict:
 def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
+    context = restore_conversation_context(customer_id, context)
     context = extract_context(payload.message, context)
     stage = stage_after_message(context, row["sales_stage"])
     action = choose_next_action(context, stage, payload.message)
     if action["action"] == "recommend":
-        need = context.get("need", "")
-        words = [word for word in need.split() if len(word) > 3][:4]
-        with connect() as db:
-            if words:
-                clauses = " OR ".join("(name LIKE ? OR description LIKE ? OR category LIKE ?)" for _ in words)
-                params = [pattern for word in words for pattern in (f"%{word}%", f"%{word}%", f"%{word}%")]
-                rows = db.execute(f"SELECT id,name,description,category,price,currency FROM products WHERE active=1 AND ({clauses}) LIMIT 3", params).fetchall()
-            else:
-                rows = []
-            if not rows:
-                rows = db.execute("SELECT id,name,description,category,price,currency FROM products WHERE active=1 ORDER BY name LIMIT 3").fetchall()
-        action["products"] = [dict(product) for product in rows]
+        products = catalogue_matches(context)
+        action["products"] = products
+        if not products:
+            action["action"] = "no_match"
+            action["reason"] = "No active catalogue items match the selected category and budget."
+            if category := context.get("product_category"):
+                action["product_category"] = category
+            action["budget_max_pkr"] = context.get("budget_max_pkr")
+            if context.get("budget_max_pkr") is not None:
+                all_category_items = catalogue_matches({**context, "budget_min_pkr": None, "budget_max_pkr": None})
+                numeric_prices = [item["price"] for item in all_category_items if item["price"] is not None]
+                if numeric_prices:
+                    action["lowest_price_pkr"] = min(numeric_prices)
+            if context.get("product_category") == "cars":
+                action["question"] = None
+                context.pop("awaiting_field", None)
+            elif context.get("budget_max_pkr") is not None:
+                context["awaiting_field"] = "budget"
+    elif action["action"] == "answer":
+        action["products"] = catalogue_matches(context)
     handoff = action["action"] == "human_handoff"
     if handoff:
         stage = "human_handoff"
         context["handoff_reason"] = action["reason"]
+    if action.get("question") == "Do you have a budget range in mind?":
+        context["awaiting_field"] = "budget"
+    elif action["action"] != "clarify_budget":
+        context.pop("awaiting_field", None)
     reply = get_provider().reply(payload.message, context, action)
+    context.pop("budget_prompt_skipped", None)
     stamp = now()
     with connect() as db:
         db.execute("INSERT INTO messages VALUES(?,?,?,?,?)", (str(uuid4()), customer_id, "customer", payload.message, stamp))
@@ -160,7 +231,13 @@ def next_action(customer_id: str) -> dict:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
     latest = context.get("last_customer_message", "")
-    return choose_next_action(context, row["sales_stage"], latest)
+    action = choose_next_action(context, row["sales_stage"], latest)
+    if action["action"] == "recommend":
+        action["products"] = catalogue_matches(context)
+        if not action["products"]:
+            action["action"] = "no_match"
+            action["reason"] = "No active catalogue items match the selected category and budget."
+    return action
 
 
 @app.post("/api/v1/sales/{customer_id}/handoff")
@@ -202,5 +279,10 @@ def sales_workspace() -> dict:
         with connect() as db:
             messages = db.execute("SELECT role,content,created_at FROM messages WHERE customer_id=? ORDER BY created_at DESC LIMIT 1", (customer.id,)).fetchone()
             action = choose_next_action(customer.context, customer.sales_stage, customer.context.get("last_customer_message", ""))
+            if action["action"] == "recommend":
+                action["products"] = catalogue_matches(customer.context)
+                if not action["products"]:
+                    action["action"] = "no_match"
+                    action["reason"] = "No active catalogue items match the selected category and budget."
         items.append({"customer": customer.model_dump(), "last_message": dict(messages) if messages else None, "next_action": action})
     return {"conversations": items}
