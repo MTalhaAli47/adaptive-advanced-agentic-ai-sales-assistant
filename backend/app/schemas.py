@@ -56,6 +56,19 @@ class OrderCreate(BaseModel):
     quantity: int = Field(default=1, ge=1, le=100)
 
 
+class CartItemCreate(BaseModel):
+    product_id: str = Field(min_length=1, max_length=120)
+    quantity: int = Field(default=1, ge=1, le=100)
+
+
+class CartItemUpdate(BaseModel):
+    quantity: int = Field(ge=1, le=100)
+
+
+class CheckoutCreate(BaseModel):
+    payment_method: Literal["cash_on_delivery", "bank_transfer"]
+
+
 class AdminOrderUpdate(BaseModel):
     status: Literal["pending_confirmation", "confirmed", "cancelled"] | None = None
     payment_status: Literal["not_paid", "paid", "refunded"] | None = None

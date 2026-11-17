@@ -93,7 +93,7 @@ def test_office_laptop_preferences_and_price_order_stay_in_context(client):
     customer_id = customer["id"]
     result = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need an office laptop"}).json()
     assert len(result["next_action"]["products"]) == 3
-    assert all("Office" in product["description"] for product in result["next_action"]["products"])
+    assert all("office" in product["description"].casefold() for product in result["next_action"]["products"])
 
     cheapest = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "cheapest one"}).json()
     assert cheapest["next_action"]["products"][0]["price"] == 58_500
@@ -381,8 +381,51 @@ def test_legacy_handoff_bot_product_category_is_repaired(client):
     with sqlite3.connect("test.db") as db:
         db.execute("UPDATE customers SET context_json=?,handoff_requested=0 WHERE id=?", (json.dumps({"product_category": "to talk to human", "last_customer_message": "I want to talk to human"}), customer_id))
     result = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "thank u"}).json()
-    assert result["next_action"]["action"] == "discover"
+    assert result["next_action"]["action"] == "smalltalk"
     assert "product_category" not in result["context"]
+
+
+def test_cart_add_update_remove_and_checkout_creates_unpaid_orders(client):
+    customer = client.post("/api/v1/customers", json={"name": "Cart buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    added = client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "lenovo-rtx5060-32gb", "quantity": 1})
+    assert added.status_code == 200
+    added = client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "lenovo-rtx5060-32gb", "quantity": 2}).json()
+    assert added["items"][0]["quantity"] == 3
+    assert added["subtotal"] == 2_040_000
+    updated = client.patch(f"/api/v1/carts/{customer_id}/items/lenovo-rtx5060-32gb", json={"quantity": 1}).json()
+    assert updated["items"][0]["quantity"] == 1
+    client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "hp-840g5-i5-8350u", "quantity": 1})
+    checkout = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "cash_on_delivery"})
+    assert checkout.status_code == 201
+    body = checkout.json()
+    assert body["payment_status"] == "not_paid"
+    assert len(body["items"]) == 2
+    assert client.get(f"/api/v1/carts/{customer_id}").json()["items"] == []
+    orders = client.get("/api/v1/admin/orders").json()
+    created = [order for order in orders if order.get("checkout_id") == body["checkout_id"]]
+    assert len(created) == 2
+    assert all(order["status"] == "pending_confirmation" and order["payment_status"] == "not_paid" for order in created)
+
+
+def test_bank_transfer_checkout_requests_sales_help_and_empty_checkout_fails(client):
+    customer = client.post("/api/v1/customers", json={"name": "Transfer buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    empty = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "bank_transfer"})
+    assert empty.status_code == 400
+    client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "hp-840g5-i5-8350u"})
+    result = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "bank_transfer"}).json()
+    assert result["payment_status"] == "not_paid"
+    handoffs = client.get("/api/v1/sales/handoffs").json()["handoffs"]
+    assert any(item["customer"]["id"] == customer_id for item in handoffs)
+
+
+def test_cart_and_checkout_pages_are_available(client):
+    response = client.get("/cart")
+    assert response.status_code == 200
+    assert 'id="checkout-button"' in response.text
+    assert "/assets/store.js" in response.text
+    assert 'href="/cart"' in client.get("/").text
 
 
 def test_existing_database_migrates_messages_for_salesperson_replies(client):

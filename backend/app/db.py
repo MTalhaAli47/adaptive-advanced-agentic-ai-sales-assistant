@@ -95,6 +95,13 @@ def initialize_database() -> None:
                 updated_at TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cart_items (
+                customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 100),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(customer_id, product_id)
+            );
             """
         )
         message_schema = db.execute(
@@ -116,6 +123,7 @@ def initialize_database() -> None:
             db.execute("CREATE INDEX idx_messages_customer_created ON messages(customer_id, created_at)")
         order_columns = {row["name"] for row in db.execute("PRAGMA table_info(orders)").fetchall()}
         for column, definition in (
+            ("checkout_id", "TEXT"),
             ("payment_status", "TEXT NOT NULL DEFAULT 'not_paid'"),
             ("fulfillment_status", "TEXT NOT NULL DEFAULT 'not_started'"),
             ("payment_method", "TEXT"), ("payment_reference", "TEXT"), ("admin_note", "TEXT"),

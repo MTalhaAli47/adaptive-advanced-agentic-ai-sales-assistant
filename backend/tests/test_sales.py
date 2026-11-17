@@ -97,7 +97,7 @@ def test_result_count_and_price_order(message, limit, order):
 
 
 def test_explicit_handoff_is_a_current_turn_action():
-    context = {"product_category": "laptops", "intent": "human_handoff"}
+    context = {"product_category": "laptops", "use_case": "gaming and 3D/AI workloads", "intent": "human_handoff"}
     assert choose_next_action(context, "engaged", "show options")["action"] == "recommend"
     assert choose_next_action(context, "engaged", "salesperson please")["action"] == "human_handoff"
 

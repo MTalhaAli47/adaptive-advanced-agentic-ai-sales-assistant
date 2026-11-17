@@ -14,7 +14,7 @@ from app.ai.providers import get_provider
 from app.config import get_settings
 from app.db import connect, decode_context, initialize_database
 from app.sales import choose_next_action, extract_context, stage_after_message
-from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate
+from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, CartItemCreate, CartItemUpdate, CheckoutCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate
 
 settings = get_settings()
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
@@ -37,6 +37,11 @@ def home():
 @app.get("/chat")
 def chat_page():
     return FileResponse(WEB_DIR / "chat.html")
+
+
+@app.get("/cart")
+def cart_page():
+    return FileResponse(WEB_DIR / "cart.html")
 
 
 @app.get("/sales")
@@ -508,6 +513,78 @@ def create_order(customer_id: str, payload: OrderCreate) -> dict:
         stamp = now()
         db.execute("INSERT INTO orders(id,customer_id,product_id,quantity,status,payment_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (order_id, customer_id, payload.product_id, payload.quantity, "pending_confirmation", "not_paid", stamp, stamp))
     return {"id": order_id, "customer_id": customer_id, "product": product["name"], "quantity": payload.quantity, "status": "pending_confirmation", "payment_status": "not_paid", "message": "Order request recorded for salesperson confirmation. No payment has been taken."}
+
+
+def cart_snapshot(db, customer_id: str) -> dict:
+    rows = db.execute(
+        """SELECT c.product_id,c.quantity,p.name,p.description,p.price,p.currency
+           FROM cart_items c JOIN products p ON p.id=c.product_id
+           WHERE c.customer_id=? AND p.active=1 ORDER BY p.name""", (customer_id,)
+    ).fetchall()
+    items = [dict(row) | {"line_total": (row["price"] or 0) * row["quantity"]} for row in rows]
+    return {"customer_id": customer_id, "items": items,
+            "subtotal": sum(item["line_total"] for item in items),
+            "currency": items[0]["currency"] if items else "PKR"}
+
+
+@app.get("/api/v1/carts/{customer_id}")
+def get_cart(customer_id: str) -> dict:
+    get_customer_row(customer_id)
+    with connect() as db:
+        return cart_snapshot(db, customer_id)
+
+
+@app.post("/api/v1/carts/{customer_id}/items")
+def add_cart_item(customer_id: str, payload: CartItemCreate) -> dict:
+    get_customer_row(customer_id)
+    with connect() as db:
+        if not db.execute("SELECT id FROM products WHERE id=? AND active=1", (payload.product_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Product not found")
+        current = db.execute("SELECT quantity FROM cart_items WHERE customer_id=? AND product_id=?", (customer_id, payload.product_id)).fetchone()
+        quantity = (current["quantity"] if current else 0) + payload.quantity
+        if quantity > 100:
+            raise HTTPException(status_code=422, detail="Cart quantity cannot exceed 100 per product")
+        db.execute("INSERT INTO cart_items(customer_id,product_id,quantity,updated_at) VALUES(?,?,?,?) ON CONFLICT(customer_id,product_id) DO UPDATE SET quantity=excluded.quantity,updated_at=excluded.updated_at", (customer_id, payload.product_id, quantity, now()))
+        return cart_snapshot(db, customer_id)
+
+
+@app.patch("/api/v1/carts/{customer_id}/items/{product_id}")
+def update_cart_item(customer_id: str, product_id: str, payload: CartItemUpdate) -> dict:
+    get_customer_row(customer_id)
+    with connect() as db:
+        result = db.execute("UPDATE cart_items SET quantity=?,updated_at=? WHERE customer_id=? AND product_id=?", (payload.quantity, now(), customer_id, product_id))
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Cart item not found")
+        return cart_snapshot(db, customer_id)
+
+
+@app.delete("/api/v1/carts/{customer_id}/items/{product_id}")
+def delete_cart_item(customer_id: str, product_id: str) -> dict:
+    get_customer_row(customer_id)
+    with connect() as db:
+        db.execute("DELETE FROM cart_items WHERE customer_id=? AND product_id=?", (customer_id, product_id))
+        return cart_snapshot(db, customer_id)
+
+
+@app.post("/api/v1/carts/{customer_id}/checkout", status_code=201)
+def checkout_cart(customer_id: str, payload: CheckoutCreate) -> dict:
+    get_customer_row(customer_id)
+    checkout_id = str(uuid4())
+    stamp = now()
+    with connect() as db:
+        cart = cart_snapshot(db, customer_id)
+        if not cart["items"]:
+            raise HTTPException(status_code=400, detail="Your cart is empty")
+        for item in cart["items"]:
+            db.execute("INSERT INTO orders(id,checkout_id,customer_id,product_id,quantity,status,payment_status,payment_method,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (str(uuid4()), checkout_id, customer_id, item["product_id"], item["quantity"], "pending_confirmation", "not_paid", payload.payment_method, stamp, stamp))
+        db.execute("DELETE FROM cart_items WHERE customer_id=?", (customer_id,))
+        if payload.payment_method == "bank_transfer":
+            customer = db.execute("SELECT context_json FROM customers WHERE id=?", (customer_id,)).fetchone()
+            context = decode_context(customer["context_json"])
+            context["handoff_reason"] = "Customer requested bank transfer checkout; share verified payment instructions after confirming the order."
+            db.execute("UPDATE customers SET handoff_requested=1,sales_stage='human_handoff',context_json=? WHERE id=?", (json.dumps(context), customer_id))
+    return {"checkout_id": checkout_id, "customer_id": customer_id, "items": cart["items"], "subtotal": cart["subtotal"], "currency": cart["currency"], "payment_method": payload.payment_method, "payment_status": "not_paid", "status": "pending_confirmation", "message": "Order request recorded. Payment has not been taken. A salesperson will confirm availability and share bank transfer instructions if selected."}
 
 
 @app.get("/api/v1/admin/summary")
