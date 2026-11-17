@@ -17,7 +17,7 @@ WhatsApp ───┘                                  ├─> Customer context 
 
 - SQLite is a local development persistence choice, not a confirmed production database decision.
 - Context extraction and NBA are deliberately transparent starter rules. They are not production quality NLP or a substitute for business policy.
-- `SalesAssistantProvider` isolates response generation. Cloud Gemini and Ollama adapters are not wired until provider/model choices and runtime dependencies are confirmed.
+- `SalesAssistantProvider` isolates response generation. A Gemini adapter uses the official Google GenAI SDK when `LLM_PROVIDER=gemini` and a key is set; deterministic local fallback remains available. Ollama is not wired.
 - A shared sample product catalogue with keyword matching, customer website/chat surfaces, a basic salesperson workspace, appointment requests, and approval-gated order records are implemented.
 - WhatsApp transport, full RAG ingestion/vector retrieval, appointment confirmation, CRM synchronization, authentication/authorization, audit controls, and deployment are not implemented yet.
 - The API has no authentication in this starter. Keep it on a trusted local development environment until access controls are added.

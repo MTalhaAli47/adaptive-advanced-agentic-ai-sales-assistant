@@ -10,10 +10,11 @@ Updated 17 November 2026. This status reflects the files in this workspace, not 
 - Customer landing page, embedded chat widget, full-page chat, and one salesperson workspace.
 - Appointment request persistence and basic order intent records that remain pending approval; no payment processing.
 - Local no-key response provider and an isolated provider interface.
+- Gemini Flash-Lite adapter using the official Google GenAI SDK, with a local fallback on API errors.
 
 ## Still planned or unverified
 
-- Real Gemini and Ollama provider adapters and model selection.
+- Ollama adapter and production validation of the Gemini key/model access.
 - WhatsApp Business webhook and outbound messaging credentials/configuration.
 - Production database, schema migrations, authentication, role access, audit trail, privacy/retention controls, and security review.
 - Full knowledge ingestion/RAG, vetted production catalogue and business policies.
