@@ -84,7 +84,15 @@ def initialize_database() -> None:
                 customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
                 product_id TEXT NOT NULL REFERENCES products(id),
                 quantity INTEGER NOT NULL CHECK(quantity > 0),
-                status TEXT NOT NULL DEFAULT 'pending_approval',
+                status TEXT NOT NULL DEFAULT 'pending_confirmation',
+                payment_status TEXT NOT NULL DEFAULT 'not_paid',
+                fulfillment_status TEXT NOT NULL DEFAULT 'not_started',
+                payment_method TEXT,
+                payment_reference TEXT,
+                admin_note TEXT,
+                confirmed_at TEXT,
+                payment_updated_at TEXT,
+                updated_at TEXT,
                 created_at TEXT NOT NULL
             );
             """
@@ -106,6 +114,15 @@ def initialize_database() -> None:
             db.execute("DROP TABLE messages")
             db.execute("ALTER TABLE messages_new RENAME TO messages")
             db.execute("CREATE INDEX idx_messages_customer_created ON messages(customer_id, created_at)")
+        order_columns = {row["name"] for row in db.execute("PRAGMA table_info(orders)").fetchall()}
+        for column, definition in (
+            ("payment_status", "TEXT NOT NULL DEFAULT 'not_paid'"),
+            ("fulfillment_status", "TEXT NOT NULL DEFAULT 'not_started'"),
+            ("payment_method", "TEXT"), ("payment_reference", "TEXT"), ("admin_note", "TEXT"),
+            ("confirmed_at", "TEXT"), ("payment_updated_at", "TEXT"), ("updated_at", "TEXT"),
+        ):
+            if column not in order_columns:
+                db.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
         existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
         for column, definition in (
             ("brand", "TEXT"), ("ram_gb", "INTEGER"), ("gpu_model", "TEXT"),

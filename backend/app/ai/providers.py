@@ -17,7 +17,25 @@ class LocalFallbackProvider:
     def reply(self, customer_message: str, context: dict, next_action: dict) -> str:
         action = next_action.get("action")
         if action == "human_handoff":
-            return "I’ll pass this conversation to a salesperson so they can help you directly."
+            return "Of course—I’ve sent this conversation to a salesperson. They can confirm availability and reply here."
+        if action == "payment_help":
+            return "I can’t collect or verify a payment in this chat. I’ve sent your request to a salesperson, who can confirm the order and share the available payment instructions. No payment has been processed."
+        if action == "apology":
+            return next_action.get("reply", "I’m sorry—I lost track. Tell me what you want to do next and I’ll keep to that request.")
+        if action == "smalltalk":
+            if context.get("last_order_fulfillment_status") == "delivered":
+                return "You’re welcome. Sales has marked that order delivered. Let me know if you need help with anything else."
+            if context.get("last_order_payment_status") == "paid":
+                return "You’re welcome. Sales has recorded the payment as received. Let me know if you need help with the order."
+            if context.get("last_order_status") == "confirmed":
+                return "You’re welcome. Your order is confirmed. A salesperson can help with delivery and payment arrangements here."
+            if context.get("last_order_id"):
+                return "You’re welcome. Your order request is still waiting for salesperson confirmation; no payment has been taken."
+            return "You’re welcome! Would you like to compare an option, ask a salesperson a question, or look for something else?"
+        if action in {"clarify_use", "clarify_appointment", "select_product"}:
+            return next_action.get("question", "Which of the listed products would you like?")
+        if action == "awaiting_salesperson":
+            return "Your message is in the conversation. A salesperson will reply here."
         if action == "discover":
             return next_action.get("question", "Hi! I can help with laptops, solar, and software. What are you looking for?")
         if action == "greet":
@@ -38,18 +56,29 @@ class LocalFallbackProvider:
         if action == "recommend":
             products = next_action.get("products", [])
             if products:
-                lines = [
-                    f"• {product['name']} — {product['currency']} {int(product['price']):,}" if product.get("price") is not None
-                    else f"• {product['name']} — price on request"
-                    for product in products[:5]
-                ]
-                lines = [f"{line}\n  {product['description']}" for line, product in zip(lines, products[:5])]
-                message = "Here are the matching options in our catalogue:\n" + "\n".join(lines)
+                lines = []
+                for product in products[:5]:
+                    price = f"{product['currency']} {int(product['price']):,}" if product.get("price") is not None else "price on request"
+                    specs = []
+                    if product.get("ram_gb"):
+                        specs.append(f"{product['ram_gb']}GB RAM")
+                    if product.get("gpu_model"):
+                        specs.append(f"{product['gpu_model']} ({product.get('vram_gb')}GB VRAM)")
+                    if product.get("storage_gb"):
+                        specs.append(f"{product['storage_gb'] // 1024}TB SSD" if product['storage_gb'] >= 1024 else f"{product['storage_gb']}GB SSD")
+                    if product.get("condition") and "used" in product["condition"].casefold():
+                        specs.append("used")
+                    detail = f" — {' · '.join(specs)}" if specs else ""
+                    lines.append(f"• {product['name']} — {price}{detail}")
+                message = "I found these options in the catalogue:\n" + "\n".join(lines)
                 question = next_action.get("question")
                 if question:
                     message += f"\n\n{question}"
                 else:
-                    message += "\n\nA salesperson can confirm current stock and final terms."
+                    if len(products) == 1:
+                        message += "\n\nThis is the only current match. Would you like me to record an order request or ask a salesperson to confirm availability?"
+                    else:
+                        message += "\n\nWhich option looks closest to what you need? I can help place an order request or ask sales to confirm availability."
                 return message
             return "Thanks, I have the key details. I’ll use them to find a suitable option; a salesperson can confirm availability and final terms."
         if action == "answer":
@@ -73,7 +102,7 @@ class GeminiProvider:
     def reply(self, customer_message: str, context: dict, next_action: dict) -> str:
         # Catalog selection and recovery prompts are deterministic so the LLM cannot
         # change the customer's active product category or repeat stale questions.
-        if next_action.get("action") in {"human_handoff", "discover", "greet", "clarify_budget", "no_match", "recommend"}:
+        if next_action.get("action") in {"human_handoff", "payment_help", "awaiting_salesperson", "apology", "smalltalk", "clarify_use", "clarify_appointment", "appointment_created", "select_product", "place_order", "order_created", "discover", "greet", "clarify_budget", "no_match", "recommend"}:
             return self.fallback.reply(customer_message, context, next_action)
 
         from google.genai import types

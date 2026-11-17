@@ -11,7 +11,8 @@ An adaptive sales assistant MVP foundation. The backend keeps customer context a
 - Shared demo product catalogue and keyword search/recommendations
 - Website landing page, embedded chat widget, and full-page chat
 - Salesperson workspace with a named HandOffs queue and two-way replies to customers
-- Appointment requests and approval-gated basic order records
+- Order placement from chat, with an admin page for confirmation and payment-status records
+- Appointment requests and a shared product catalogue
 - Pluggable LLM interface, with a deterministic local fallback
 - Human handoff signals for uncertain or approval-required actions
 
@@ -44,6 +45,12 @@ Open `http://127.0.0.1:8000/docs` for the API interface. SQLite data is stored i
 - `GET /api/v1/products?q=solar`
 - `GET /api/v1/sales/workspace`
 - `GET /api/v1/sales/handoffs`
+- `GET /api/v1/admin/orders`
+- `GET /api/v1/admin/appointments`
+- `GET /api/v1/admin/summary`
+- `PATCH /api/v1/admin/orders/{order_id}`
+- `PATCH /api/v1/admin/appointments/{appointment_id}`
+- `/admin` (order, payment, fulfillment, and appointment workspace)
 - `POST /api/v1/sales/{customer_id}/messages` (salesperson reply to a requested handoff)
 - `POST /api/v1/sales/{customer_id}/handoff/resolve`
 - `POST /api/v1/appointments/{customer_id}`
@@ -53,7 +60,7 @@ The API is channel-neutral. Do not build separate customer or salesperson backen
 
 ## Current limits
 
-This is a runnable starter MVP, not a production deployment. WhatsApp transport, authentication and role permissions, appointment confirmation, CRM synchronization, deployment, and operational monitoring still need implementation. Orders are recorded as pending salesperson approval; payment is not processed. The sample catalogue is placeholder data and should be replaced with the business's approved products and prices. See [the architecture notes](docs/architecture.md) for boundaries and risks.
+This is a runnable starter MVP, not a production deployment. WhatsApp transport, authentication and role permissions, CRM synchronization, deployment, and operational monitoring still need implementation. The `/admin` page records staff-confirmed appointment/order/payment states; it does not collect or verify payments. The sample catalogue is placeholder data and should be replaced with the business's approved products and prices. See [the architecture notes](docs/architecture.md) for boundaries and risks.
 
 The current catalogue is structured SQL data, so product discovery uses direct database filtering and does not need vector RAG. Add RAG when there are approved product manuals, FAQs, policies, or other long-form sales documents to retrieve from; keep price and stock checks grounded in the live catalogue.
 
@@ -64,5 +71,5 @@ Install development checks and run the broad backend/browser cases from the repo
 ```powershell
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
-node --test web/tests/chat.test.js
+node --test web/tests/chat.test.js web/tests/admin.test.js
 ```

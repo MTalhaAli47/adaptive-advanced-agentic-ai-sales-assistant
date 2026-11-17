@@ -142,3 +142,28 @@ def test_cheapest_or_most_expensive_answer_does_not_repeat_budget_prompt():
         action = choose_next_action(context, "engaged", message)
         assert action["question"] is None
 
+
+def test_order_payment_confirmation_and_human_phrases_are_distinct_intents():
+    context = {"product_category": "laptops", "last_recommended_product_ids": ["lenovo-rtx5060-32gb"]}
+    assert choose_next_action(context, "engaged", "place my order")["action"] == "place_order"
+    assert choose_next_action(context, "engaged", "I want to make payment")["action"] == "payment_help"
+    assert choose_next_action(context, "engaged", "please confirm it")["action"] == "human_handoff"
+    assert choose_next_action(context, "engaged", "let me talk to him")["action"] == "human_handoff"
+
+
+def test_payment_language_is_not_mistaken_for_a_product_category():
+    context = extract_context("I want to make payment", {})
+    assert "product_category" not in context
+    assert context["intent"] == "payment_help"
+
+
+def test_budget_and_laptop_use_clarifications_do_not_fall_back_to_recommendations():
+    budget_context = {"product_category": "laptops", "awaiting_field": "budget"}
+    assert choose_next_action(budget_context, "engaged", "a")["action"] == "clarify_budget"
+    use_context = {"product_category": "laptops", "awaiting_field": "use_case"}
+    assert choose_next_action(use_context, "engaged", "a")["action"] == "clarify_use"
+
+
+def test_thanks_is_smalltalk_instead_of_repeating_product_results():
+    assert choose_next_action({"product_category": "laptops"}, "engaged", "thank u")["action"] == "smalltalk"
+

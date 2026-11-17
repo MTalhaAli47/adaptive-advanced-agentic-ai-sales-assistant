@@ -46,6 +46,20 @@ class AppointmentCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
 
 
+class AdminAppointmentUpdate(BaseModel):
+    status: Literal["requested", "confirmed", "cancelled", "completed"]
+    notes: str | None = Field(default=None, max_length=1000)
+
+
 class OrderCreate(BaseModel):
     product_id: str
     quantity: int = Field(default=1, ge=1, le=100)
+
+
+class AdminOrderUpdate(BaseModel):
+    status: Literal["pending_confirmation", "confirmed", "cancelled"] | None = None
+    payment_status: Literal["not_paid", "paid", "refunded"] | None = None
+    fulfillment_status: Literal["not_started", "processing", "shipped", "delivered", "returned"] | None = None
+    payment_method: str | None = Field(default=None, max_length=80)
+    payment_reference: str | None = Field(default=None, max_length=160)
+    admin_note: str | None = Field(default=None, max_length=1000)

@@ -5,10 +5,35 @@ from typing import Any
 STAGES = ("new", "engaged", "qualifying", "qualified", "recommended", "appointment", "order_confirmed", "won", "lost")
 AMOUNT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(million|millions|m|lakh|lakhs|lac|lacs|k|thousand|thousands)?\b", re.IGNORECASE)
 HANDOFF_RE = re.compile(r"\b(?:human|person|agent|sales\s*person|salesperson|sales\s*rep|representative)\b|\bcall me\b", re.IGNORECASE)
+CONFIRM_RE = re.compile(r"\b(?:confirm|verify)\b.*\b(?:it|this|that|stock|availability|order|payment)\b|\b(?:is it|are they)\s+(?:available|in stock)\b", re.IGNORECASE)
+PAYMENT_RE = re.compile(r"\b(?:payment|pay|paying|checkout|bank transfer|transfer money)\b", re.IGNORECASE)
+ORDER_RE = re.compile(r"\b(?:place|put in|make)\s+(?:(?:my|an?|the)\s+)?orders?\b|\b(?:order|buy|purchase)\s+(?:it|this|that|the\s+[\w-]+)\b|\bi(?:'ll| will) take (?:it|this|that)\b", re.IGNORECASE)
+FRUSTRATION_RE = re.compile(r"\b(?:are you mad|mad|silly|stupid|useless|you lost|lost context|not listening|frustrated|annoyed)\b|\b(?:uff+|ugh+)\b", re.IGNORECASE)
+THANKS_RE = re.compile(r"\b(?:thanks|thank you|thank u|thx)\b", re.IGNORECASE)
+APPOINTMENT_RE = re.compile(r"\b(?:appointment|meeting|demo)\b|\bbook\s+(?:a\s+)?call\b|\b(?:book|schedule|arrange)\b.{0,30}\b(?:call|session)\b", re.IGNORECASE)
 
 
 def _requests_human(text: str) -> bool:
-    return bool(HANDOFF_RE.search(text) or re.search(r"\b(?:talk|speak|chat|connect|call|reach)\b.{0,30}\b(?:employee|staff)\b", text, re.IGNORECASE))
+    return bool(
+        HANDOFF_RE.search(text)
+        or re.search(r"\b(?:talk|speak|chat|connect|call|reach)\b.{0,30}\b(?:employee|staff|him|her|them|someone)\b", text, re.IGNORECASE)
+    )
+
+
+def _requests_salesperson(text: str) -> bool:
+    return _requests_human(text) or bool(CONFIRM_RE.search(text)) or bool(re.search(r"\b(?:confirm|verify)\b", text, re.IGNORECASE))
+
+
+def _requests_payment(text: str) -> bool:
+    return bool(PAYMENT_RE.search(text))
+
+
+def _requests_order(text: str) -> bool:
+    return bool(ORDER_RE.search(text))
+
+
+def _requests_appointment(text: str) -> bool:
+    return bool(APPOINTMENT_RE.search(text))
 
 
 def _amount(value: str, unit: str | None) -> int:
@@ -32,6 +57,8 @@ def _category(text: str) -> str | None:
         return "software"
     if _requests_human(text):
         return None
+    if _requests_appointment(text):
+        return None
     request = re.search(
         r"\b(?:i need|i want|looking for|search for|do you have|do you sell|sell me|show me|recommend(?: me)?|looking to buy|buy)\s+(?:a|an|some|any|the)?\s*([a-z0-9][a-z0-9 -]{1,48})",
         text,
@@ -39,6 +66,8 @@ def _category(text: str) -> str | None:
     if request:
         interest = request.group(1).strip(" .?!,")
         interest = re.sub(r"\b(please|for me|today|now)\b", "", interest).strip()
+        if re.search(r"\b(payment|pay|order|purchase|human|person|agent|representative|confirm|verify|availability)\b", interest):
+            return None
         if interest and interest not in {"something", "anything", "one", "some"}:
             return interest
     return None
@@ -62,11 +91,27 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("budget_clarification_count", None)
         context.pop("budget_prompt_skipped", None)
         context.pop("budget_no_match", None)
+        context.pop("awaiting_field", None)
         context.pop("gpu_model", None)
         context.pop("minimum_ram_gb", None)
         context.pop("minimum_vram_gb", None)
         context.pop("result_limit", None)
         context.pop("price_order", None)
+
+    appointment_requested = _requests_appointment(lowered)
+    if appointment_requested:
+        time_match = re.search(r"\b(?:on|at|for)\s+(.+)$", text, re.IGNORECASE)
+        if time_match and len(time_match.group(1).strip()) >= 3:
+            context["appointment_requested_time"] = time_match.group(1).strip()[:120]
+            context["pending_appointment"] = True
+            context.pop("awaiting_field", None)
+        else:
+            context["pending_appointment"] = True
+            context["awaiting_field"] = "appointment_time"
+    elif context.get("awaiting_field") == "appointment_time" and len(text) >= 3:
+        context["appointment_requested_time"] = text[:120]
+        context["pending_appointment"] = True
+        context.pop("awaiting_field", None)
 
     count_names = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
     count_match = re.search(r"\b(?:show|give|list)\s+(?:me\s+)?(?:only\s+)?(\d{1,2}|one|two|three|four|five)\s+(?:\w+\s+)?(?:products?|items?|laptops?|options?|results?)\b", lowered)
@@ -82,6 +127,9 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     elif any(term in lowered for term in ("show all", "all options", "show more")):
         context.pop("result_limit", None)
         context["price_order"] = "ASC"
+    if context.get("awaiting_field") == "budget" and (context.get("result_limit") or context.get("price_order")):
+        context.pop("awaiting_field", None)
+        context["budget_flexible"] = True
 
     gpu = re.search(r"\brtx\s*(5070\s*ti|5060|5070|5080|5090)\b", lowered)
     if gpu:
@@ -97,8 +145,12 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
 
     if any(term in lowered for term in ("gaming", "game", "3d", "render", "ai work", "machine learning")):
         context["use_case"] = "gaming and 3D/AI workloads"
+        if context.get("awaiting_field") == "use_case":
+            context.pop("awaiting_field", None)
     elif any(term in lowered for term in ("office", "email", "word processing", "small tasks")):
         context["use_case"] = "office and everyday tasks"
+        if context.get("awaiting_field") == "use_case":
+            context.pop("awaiting_field", None)
 
     budget_text = re.sub(r"\blakg\b", "lakh", text, flags=re.IGNORECASE)
     budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", budget_text, flags=re.IGNORECASE)
@@ -164,9 +216,15 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     if any(term in lowered for term in ("tomorrow", "this week", "next week", "this month", "next month", "soon", "within")):
         context["timeline"] = text[:160]
 
-    if _requests_human(lowered):
+    if _requests_salesperson(lowered):
         context["intent"] = "human_handoff"
-    elif any(word in lowered for word in ("buy", "order", "purchase", "book")):
+    elif _requests_payment(lowered):
+        context["intent"] = "payment_help"
+    elif _requests_appointment(lowered):
+        context["intent"] = "appointment_request"
+    elif _requests_order(lowered):
+        context["intent"] = "purchase"
+    elif any(word in lowered for word in ("buy", "order", "purchase")):
         context["intent"] = "purchase"
     elif any(word in lowered for word in ("price", "cost", "budget", "how much")):
         context["intent"] = "pricing"
@@ -183,8 +241,37 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
     lowered = message.casefold()
     if _requests_human(lowered):
         return {"action": "human_handoff", "reason": "Customer requested a person.", "requires_approval": False}
+    if CONFIRM_RE.search(lowered) or re.search(r"\b(?:confirm|verify)\b", lowered):
+        return {"action": "human_handoff", "reason": "Customer asked a salesperson to confirm availability or order details.", "requires_approval": False}
+    if _requests_payment(lowered):
+        return {"action": "payment_help", "reason": "Customer needs help arranging payment; no payment is taken in chat."}
+    if _requests_order(lowered):
+        return {"action": "place_order", "reason": "Customer explicitly asked to place an order."}
+    if _requests_appointment(lowered) or context.get("pending_appointment"):
+        if context.get("appointment_requested_time"):
+            return {"action": "create_appointment", "reason": "Customer asked to schedule a meeting and provided a requested time."}
+        context["awaiting_field"] = "appointment_time"
+        return {
+            "action": "clarify_appointment",
+            "reason": "The appointment request needs a date or time before it can be recorded.",
+            "question": "I can pass that along. What day and time should I request?",
+        }
+    if FRUSTRATION_RE.search(lowered):
+        category = context.get("product_category")
+        focus = f"I’m helping you with {category}. " if category else ""
+        return {
+            "action": "apology",
+            "reason": "Customer is frustrated; acknowledge it and offer a clear next step.",
+            "reply": f"I’m sorry—I lost track of what you asked. {focus}Would you like me to show options, ask a salesperson to confirm availability, or help place an order?",
+        }
+    if THANKS_RE.search(lowered):
+        return {"action": "smalltalk", "reason": "Acknowledge the customer and keep their order context."}
 
     category = context.get("product_category")
+    if context.get("awaiting_field") == "product_selection":
+        if re.fullmatch(r"\s*(no|cancel|not now|never mind)[.\s]*", lowered):
+            return {"action": "cancel_order_request", "reason": "Customer cancelled product selection."}
+        return {"action": "place_order", "reason": "Customer is selecting one of the products just offered."}
     if not category:
         if re.search(r"\b(hi|hello|hey)\b", lowered):
             return {"action": "discover", "reason": "Start by identifying the product category."}
@@ -192,6 +279,14 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
             "action": "discover",
             "reason": "No product category has been identified yet.",
             "question": "What product or service are you looking for? I’ll check it against the current catalogue.",
+        }
+
+    if context.get("awaiting_field") == "use_case" and not context.get("use_case"):
+        return {
+            "action": "clarify_use",
+            "reason": "The customer needs to choose between the catalogue's office and gaming laptop types.",
+            "product_category": category,
+            "question": "Are you looking for an office laptop for everyday work, or a gaming laptop for gaming, 3D, and AI? You can also tell me a different use.",
         }
 
     if re.fullmatch(r"\s*(hi|hello|hey|good morning|good afternoon|good evening)[!.\s]*", lowered):
@@ -208,6 +303,23 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
             "action": "clarify_budget",
             "reason": "The customer agreed to share a budget but did not give an amount.",
             "question": prompt,
+        }
+
+    if context.get("awaiting_field") == "budget":
+        return {
+            "action": "clarify_budget",
+            "reason": "The last message did not contain a usable budget amount.",
+            "question": "I didn’t catch a budget amount. You can give a range like 600,000–700,000 PKR, say ‘no fixed budget’, or skip it.",
+        }
+
+    if (category == "laptops" and not context.get("use_case") and not context.get("budget_max_pkr")
+            and not context.get("budget_flexible") and not context.get("result_limit") and not context.get("price_order")):
+        context["awaiting_field"] = "use_case"
+        return {
+            "action": "clarify_use",
+            "reason": "The catalogue has distinct office and gaming laptops; ask which fits the customer.",
+            "product_category": category,
+            "question": "Are you looking for an office laptop for everyday work, or a gaming laptop for gaming, 3D, and AI? You can also tell me a different use.",
         }
 
     factual_question = (
