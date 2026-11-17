@@ -40,6 +40,7 @@ function buildBrowserHarness() {
   const data = new Map([['aisa_customer_id', 'old-customer']]);
   const ready = {};
   const requests = [];
+  let poll;
   let releaseHistory;
   const oldHistory = new Promise(resolve => { releaseHistory = resolve; });
   const document = {
@@ -52,6 +53,7 @@ function buildBrowserHarness() {
     if (url.includes('/conversations/old-customer')) return oldHistory;
     if (url.endsWith('/customers')) return { ok: true, json: async () => ({ id: 'new-customer' }) };
     if (url.includes('/conversations/new-customer/messages')) return { ok: true, json: async () => ({ reply: 'Fresh response', handoff_required: false }) };
+    if (url.endsWith('/conversations/new-customer')) return { json: async () => ({ messages: [{ id: 'sales-1', role: 'salesperson', content: 'A salesperson is here.' }] }) };
     throw new Error(`Unexpected request: ${url}`);
   };
   const context = {
@@ -63,11 +65,12 @@ function buildBrowserHarness() {
       removeItem(key) { data.delete(key); },
     },
     prompt: () => 'Test user',
+    window: { setInterval(callback) { poll = callback; return 1; } },
     console,
   };
   const source = fs.readFileSync(path.join(__dirname, '..', 'assets', 'chat.js'), 'utf8');
   vm.runInNewContext(source, context, { filename: 'chat.js' });
-  return { box, input, form, newChat, ready, data, requests, releaseHistory };
+  return { box, input, form, newChat, ready, data, requests, releaseHistory, poll: () => poll() };
 }
 
 test('New chat clears the active identity, ignores a pending old-history response, and sends under a new customer', async () => {
@@ -87,4 +90,6 @@ test('New chat clears the active identity, ignores a pending old-history respons
   assert.equal(ui.data.get('aisa_customer_id'), 'new-customer');
   assert.ok(ui.requests.some(request => request.url.includes('/conversations/new-customer/messages')));
   assert.match(ui.box.textContent, /Fresh response/);
+  await ui.poll();
+  assert.match(ui.box.textContent, /Salesperson: A salesperson is here/);
 });

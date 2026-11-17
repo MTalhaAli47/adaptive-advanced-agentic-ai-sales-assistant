@@ -28,15 +28,32 @@ function addBubble(box, role, text) {
 
 async function setupChat(form, box) {
   const saved = getCustomer();
+  const seenSalesMessages = new Set();
   if (saved) {
     try {
       const history = await fetch(`${API}/conversations/${encodeURIComponent(saved)}`).then(r => r.json());
       if (getCustomer() === saved && history.messages.length) {
         box.replaceChildren();
-        history.messages.forEach(message => addBubble(box, message.role === 'customer' ? 'customer' : 'assistant', message.content));
+        history.messages.forEach(message => addBubble(box, message.role === 'customer' ? 'customer' : 'assistant', message.role === 'salesperson' ? `Salesperson: ${message.content}` : message.content));
       }
+      history.messages.forEach(message => { if (message.role === 'salesperson') seenSalesMessages.add(message.id); });
     } catch { /* The first message can still start a fresh conversation. */ }
   }
+
+  let checkedCustomer = saved;
+  window.setInterval(async () => {
+    const customerId = getCustomer();
+    if (!customerId) { checkedCustomer = null; return; }
+    if (customerId !== checkedCustomer) { checkedCustomer = customerId; seenSalesMessages.clear(); }
+    try {
+      const history = await fetch(`${API}/conversations/${encodeURIComponent(customerId)}`).then(r => r.json());
+      if (getCustomer() !== customerId) return;
+      history.messages.filter(message => message.role === 'salesperson' && !seenSalesMessages.has(message.id)).forEach(message => {
+        seenSalesMessages.add(message.id);
+        addBubble(box, 'assistant', `Salesperson: ${message.content}`);
+      });
+    } catch { /* The conversation can be checked again on the next poll. */ }
+  }, 3000);
 
   form.addEventListener('submit', async event => {
     event.preventDefault();
@@ -55,7 +72,6 @@ async function setupChat(form, box) {
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Request failed');
       addBubble(box, 'assistant', result.reply);
-      if (result.handoff_required) addBubble(box, 'assistant', 'A salesperson will follow up with you.');
     } catch {
       addBubble(box, 'assistant', 'I could not reach the service. Please try again shortly.');
     }

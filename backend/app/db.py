@@ -89,6 +89,23 @@ def initialize_database() -> None:
             );
             """
         )
+        message_schema = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone()[0]
+        if "'salesperson'" not in message_schema:
+            db.execute(
+                """CREATE TABLE messages_new (
+                    id TEXT PRIMARY KEY,
+                    customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('customer','assistant','system','salesperson')),
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            db.execute("INSERT INTO messages_new SELECT * FROM messages")
+            db.execute("DROP TABLE messages")
+            db.execute("ALTER TABLE messages_new RENAME TO messages")
+            db.execute("CREATE INDEX idx_messages_customer_created ON messages(customer_id, created_at)")
         existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
         for column, definition in (
             ("brand", "TEXT"), ("ram_gb", "INTEGER"), ("gpu_model", "TEXT"),

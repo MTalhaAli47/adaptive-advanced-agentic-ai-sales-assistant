@@ -27,6 +27,8 @@ def test_catalogue_categories_and_salesperson_page_are_available(client):
     page = client.get("/sales")
     assert page.status_code == 200
     assert "Sales workspace" in page.text
+    assert "HandOffs" in page.text
+    assert "/api/v1/sales/handoffs" in page.text
     home = client.get("/")
     assert 'id="widget-new-chat"' in home.text
     assert "/assets/chat.js?v=" in home.text
@@ -144,6 +146,58 @@ def test_handoff_appointment_and_order_boundaries(client):
     assert summary["handoffs"] == 1
     assert summary["appointments_to_confirm"] == 1
     assert summary["orders_pending_approval"] == 1
+
+
+def test_handoff_appears_by_customer_name_and_salesperson_can_reply(client):
+    customer = client.post("/api/v1/customers", json={"name": "Amina Khan", "channel": "web"}).json()
+    customer_id = customer["id"]
+    response = client.post(
+        f"/api/v1/conversations/{customer_id}/messages",
+        json={"message": "I wanna talk to a human"},
+    ).json()
+    assert response["handoff_required"] is True
+
+    handoffs = client.get("/api/v1/sales/handoffs").json()["handoffs"]
+    assert len(handoffs) == 1
+    assert handoffs[0]["customer"]["name"] == "Amina Khan"
+    assert handoffs[0]["customer"]["id"] == customer_id
+
+    reply = client.post(
+        f"/api/v1/sales/{customer_id}/messages",
+        json={"message": "Hi Amina, I’m a salesperson. How can I help?"},
+    )
+    assert reply.status_code == 200
+    assert reply.json()["role"] == "salesperson"
+    history = client.get(f"/api/v1/conversations/{customer_id}").json()["messages"]
+    assert history[-1]["role"] == "salesperson"
+    assert history[-1]["content"].startswith("Hi Amina")
+
+    client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a laptop"})
+    assert len(client.get("/api/v1/sales/handoffs").json()["handoffs"]) == 1
+    resolved = client.post(f"/api/v1/sales/{customer_id}/handoff/resolve").json()
+    assert resolved["resolved"] is True
+    assert client.get("/api/v1/sales/handoffs").json()["handoffs"] == []
+
+
+def test_existing_database_migrates_messages_for_salesperson_replies(client):
+    customer = client.post("/api/v1/customers", json={"name": "Legacy customer", "channel": "web"}).json()
+    with sqlite3.connect("test.db") as db:
+        db.execute("DROP TABLE messages")
+        db.execute("""CREATE TABLE messages (
+            id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK(role IN ('customer','assistant','system')),
+            content TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        db.execute("INSERT INTO messages VALUES('legacy-message',?,'customer','Existing message','2026-01-01T00:00:00Z')", (customer["id"],))
+
+    from app.db import initialize_database
+    initialize_database()
+
+    with sqlite3.connect("test.db") as db:
+        schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()[0]
+        db.execute("INSERT INTO messages VALUES('sales-message',?,'salesperson','Sales reply','2026-01-02T00:00:00Z')", (customer["id"],))
+        records = db.execute("SELECT role,content FROM messages ORDER BY created_at").fetchall()
+    assert "'salesperson'" in schema
+    assert records == [("customer", "Existing message"), ("salesperson", "Sales reply")]
 
 
 def test_conversation_history_persists_across_requests(client):

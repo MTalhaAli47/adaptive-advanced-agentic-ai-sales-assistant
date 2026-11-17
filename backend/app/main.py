@@ -256,7 +256,7 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
         db.execute("INSERT INTO messages VALUES(?,?,?,?,?)", (str(uuid4()), customer_id, "assistant", reply, now()))
         db.execute(
             "UPDATE customers SET context_json=?, sales_stage=?, handoff_requested=? WHERE id=?",
-            (json.dumps(context), stage, int(handoff), customer_id),
+            (json.dumps(context), stage, int(handoff or row["handoff_requested"]), customer_id),
         )
     return ConversationReply(customer_id=customer_id, reply=reply, sales_stage=stage, context=context, next_action=action, handoff_required=handoff)
 
@@ -267,6 +267,52 @@ def conversation_history(customer_id: str) -> dict:
     with connect() as db:
         rows = db.execute("SELECT id,customer_id,role,content,created_at FROM messages WHERE customer_id=? ORDER BY created_at", (customer_id,)).fetchall()
     return {"customer_id": customer_id, "messages": [dict(row) for row in rows]}
+
+
+@app.get("/api/v1/sales/handoffs")
+def sales_handoffs() -> dict:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT c.*, (SELECT content FROM messages m WHERE m.customer_id=c.id
+                   ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+                   (SELECT created_at FROM messages m WHERE m.customer_id=c.id
+                   ORDER BY m.created_at DESC LIMIT 1) AS last_message_at
+               FROM customers c WHERE c.handoff_requested=1
+               ORDER BY COALESCE(last_message_at,c.created_at) DESC"""
+        ).fetchall()
+    return {"handoffs": [
+        {"customer": customer_from_row(row).model_dump(), "last_message": row["last_message"],
+         "last_message_at": row["last_message_at"]}
+        for row in rows
+    ]}
+
+
+@app.post("/api/v1/sales/{customer_id}/messages")
+def salesperson_message(customer_id: str, payload: MessageIn) -> dict:
+    row = get_customer_row(customer_id)
+    if not row["handoff_requested"]:
+        raise HTTPException(status_code=409, detail="This conversation is not waiting for a salesperson")
+    message_id, stamp = str(uuid4()), now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO messages(id,customer_id,role,content,created_at) VALUES(?,?,?,?,?)",
+            (message_id, customer_id, "salesperson", payload.message, stamp),
+        )
+    return {"id": message_id, "customer_id": customer_id, "role": "salesperson",
+            "content": payload.message, "created_at": stamp}
+
+
+@app.post("/api/v1/sales/{customer_id}/handoff/resolve")
+def resolve_handoff(customer_id: str) -> dict:
+    row = get_customer_row(customer_id)
+    context = decode_context(row["context_json"])
+    context["handoff_resolved_at"] = now()
+    with connect() as db:
+        db.execute(
+            "UPDATE customers SET sales_stage='engaged', handoff_requested=0, context_json=? WHERE id=?",
+            (json.dumps(context), customer_id),
+        )
+    return {"customer_id": customer_id, "handoff_requested": False, "resolved": True}
 
 
 @app.get("/api/v1/sales/{customer_id}/next-action")
