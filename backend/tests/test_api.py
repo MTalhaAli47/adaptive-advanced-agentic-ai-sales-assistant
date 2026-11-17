@@ -66,6 +66,32 @@ def test_chat_stays_in_category_and_recovers_from_budget_no_match(client):
     assert len(result["next_action"]["products"]) == 5
 
 
+@pytest.mark.parametrize("budget", ["6 to 7 lakh", "6-7 lakg"])
+def test_lakh_budget_range_filters_to_the_requested_price_band(client, budget):
+    customer = client.post("/api/v1/customers", json={"name": "Budget buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a laptop"})
+    result = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": budget}).json()
+    products = result["next_action"]["products"]
+    assert (result["context"]["budget_min_pkr"], result["context"]["budget_max_pkr"]) == (600_000, 700_000)
+    assert len(products) == 1
+    assert products[0]["price"] == 680_000
+
+
+def test_office_laptop_preferences_and_price_order_stay_in_context(client):
+    customer = client.post("/api/v1/customers", json={"name": "Office buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    result = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need an office laptop"}).json()
+    assert len(result["next_action"]["products"]) == 3
+    assert all("Office" in product["description"] for product in result["next_action"]["products"])
+
+    cheapest = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "cheapest one"}).json()
+    assert cheapest["next_action"]["products"][0]["price"] == 58_500
+    assert cheapest["next_action"].get("question") is None
+    expensive = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "i mean most expensive"}).json()
+    assert expensive["next_action"]["products"][0]["price"] == 78_000
+
+
 def test_legacy_no_match_conversation_can_recover(client):
     customer = client.post("/api/v1/customers", json={"name": "Test", "channel": "web"}).json()
     customer_id = customer["id"]
@@ -157,6 +183,11 @@ def test_handoff_appears_by_customer_name_and_salesperson_can_reply(client):
     ).json()
     assert response["handoff_required"] is True
 
+    follow_up = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "thank u"}).json()
+    assert follow_up["next_action"]["action"] == "awaiting_salesperson"
+    assert "salesperson will reply" in follow_up["reply"].lower()
+    assert follow_up["handoff_required"] is True
+
     handoffs = client.get("/api/v1/sales/handoffs").json()["handoffs"]
     assert len(handoffs) == 1
     assert handoffs[0]["customer"]["name"] == "Amina Khan"
@@ -172,11 +203,30 @@ def test_handoff_appears_by_customer_name_and_salesperson_can_reply(client):
     assert history[-1]["role"] == "salesperson"
     assert history[-1]["content"].startswith("Hi Amina")
 
-    client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a laptop"})
+    after_sales_reply = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a laptop"}).json()
+    assert after_sales_reply["next_action"]["action"] == "awaiting_salesperson"
     assert len(client.get("/api/v1/sales/handoffs").json()["handoffs"]) == 1
     resolved = client.post(f"/api/v1/sales/{customer_id}/handoff/resolve").json()
     assert resolved["resolved"] is True
     assert client.get("/api/v1/sales/handoffs").json()["handoffs"] == []
+
+
+def test_salesperson_cannot_reply_to_an_unhanded_conversation(client):
+    customer = client.post("/api/v1/customers", json={"name": "Customer", "channel": "web"}).json()
+    response = client.post(
+        f"/api/v1/sales/{customer['id']}/messages", json={"message": "Can I help?"}
+    )
+    assert response.status_code == 409
+
+
+def test_legacy_handoff_bot_product_category_is_repaired(client):
+    customer = client.post("/api/v1/customers", json={"name": "Legacy handoff", "channel": "web"}).json()
+    customer_id = customer["id"]
+    with sqlite3.connect("test.db") as db:
+        db.execute("UPDATE customers SET context_json=?,handoff_requested=0 WHERE id=?", (json.dumps({"product_category": "to talk to human", "last_customer_message": "I want to talk to human"}), customer_id))
+    result = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "thank u"}).json()
+    assert result["next_action"]["action"] == "discover"
+    assert "product_category" not in result["context"]
 
 
 def test_existing_database_migrates_messages_for_salesperson_replies(client):

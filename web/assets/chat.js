@@ -34,7 +34,7 @@ async function setupChat(form, box) {
       const history = await fetch(`${API}/conversations/${encodeURIComponent(saved)}`).then(r => r.json());
       if (getCustomer() === saved && history.messages.length) {
         box.replaceChildren();
-        history.messages.forEach(message => addBubble(box, message.role === 'customer' ? 'customer' : 'assistant', message.role === 'salesperson' ? `Salesperson: ${message.content}` : message.content));
+        history.messages.forEach(message => addBubble(box, message.role === 'customer' ? 'customer' : message.role === 'salesperson' ? 'salesperson' : 'assistant', message.role === 'salesperson' ? `Salesperson: ${message.content}` : message.content));
       }
       history.messages.forEach(message => { if (message.role === 'salesperson') seenSalesMessages.add(message.id); });
     } catch { /* The first message can still start a fresh conversation. */ }
@@ -50,7 +50,7 @@ async function setupChat(form, box) {
       if (getCustomer() !== customerId) return;
       history.messages.filter(message => message.role === 'salesperson' && !seenSalesMessages.has(message.id)).forEach(message => {
         seenSalesMessages.add(message.id);
-        addBubble(box, 'assistant', `Salesperson: ${message.content}`);
+        addBubble(box, 'salesperson', `Salesperson: ${message.content}`);
       });
     } catch { /* The conversation can be checked again on the next poll. */ }
   }, 3000);

@@ -23,6 +23,9 @@ def test_extracts_known_and_open_ended_categories(message, category):
         ("1 lakh to 5 lakh", 100_000, 500_000),
         ("within 3 million", None, 3_000_000),
         ("100,000 - 500000 PKR", 100_000, 500_000),
+        ("6 to 7 lakh", 600_000, 700_000),
+        ("6-7 lakg", 600_000, 700_000),
+        ("600-700k", 600_000, 700_000),
     ],
 )
 def test_budget_formats(message, minimum, maximum):
@@ -122,4 +125,20 @@ def test_category_switch_resets_old_budget_but_keeps_followup_questions_scoped()
     assert context["product_category"] == "laptops"
     assert "budget_max_pkr" not in context
     assert action["product_category"] == "laptops"
+
+
+@pytest.mark.parametrize("message", [
+    "I want to talk to a human", "Can I speak with an agent?", "Connect me to a sales rep",
+])
+def test_human_request_is_never_treated_as_a_product_category(message):
+    context = extract_context(message, {})
+    assert "product_category" not in context
+    assert choose_next_action(context, "engaged", message)["action"] == "human_handoff"
+
+
+def test_cheapest_or_most_expensive_answer_does_not_repeat_budget_prompt():
+    for message in ("cheapest one", "i mean most expensive"):
+        context = {"product_category": "laptops", "result_limit": 1, "price_order": "ASC"}
+        action = choose_next_action(context, "engaged", message)
+        assert action["question"] is None
 

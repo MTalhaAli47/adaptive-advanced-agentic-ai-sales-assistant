@@ -4,6 +4,11 @@ from typing import Any
 
 STAGES = ("new", "engaged", "qualifying", "qualified", "recommended", "appointment", "order_confirmed", "won", "lost")
 AMOUNT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(million|millions|m|lakh|lakhs|lac|lacs|k|thousand|thousands)?\b", re.IGNORECASE)
+HANDOFF_RE = re.compile(r"\b(?:human|person|agent|sales\s*person|salesperson|sales\s*rep|representative)\b|\bcall me\b", re.IGNORECASE)
+
+
+def _requests_human(text: str) -> bool:
+    return bool(HANDOFF_RE.search(text) or re.search(r"\b(?:talk|speak|chat|connect|call|reach)\b.{0,30}\b(?:employee|staff)\b", text, re.IGNORECASE))
 
 
 def _amount(value: str, unit: str | None) -> int:
@@ -25,6 +30,8 @@ def _category(text: str) -> str | None:
         return "solar"
     if re.search(r"\bsoftware|crm|sales plan\b", text):
         return "software"
+    if _requests_human(text):
+        return None
     request = re.search(
         r"\b(?:i need|i want|looking for|search for|do you have|do you sell|sell me|show me|recommend(?: me)?|looking to buy|buy)\s+(?:a|an|some|any|the)?\s*([a-z0-9][a-z0-9 -]{1,48})",
         text,
@@ -93,13 +100,19 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     elif any(term in lowered for term in ("office", "email", "word processing", "small tasks")):
         context["use_case"] = "office and everyday tasks"
 
-    budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\blakg\b", "lakh", text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", budget_text, flags=re.IGNORECASE)
     budget_text = re.sub(r"\brtx\s*(?:5060|5070\s*ti|5070|5080|5090)\b", " ", budget_text, flags=re.IGNORECASE)
     budget_text = re.sub(
         r"\b(?:show|give|list)\s+(?:me\s+)?(?:only\s+)?(?:\d{1,2}|one|two|three|four|five)\s+(?:\w+\s+)?(?:products?|items?|laptops?|options?|results?)\b",
         " ", budget_text, flags=re.IGNORECASE,
     )
-    amounts = [(_amount(match.group(1), match.group(2)), match.group(0)) for match in AMOUNT_RE.finditer(budget_text)]
+    amount_matches = list(AMOUNT_RE.finditer(budget_text))
+    inferred_unit = next((match.group(2) for match in amount_matches if match.group(2)), None) if len(amount_matches) == 2 else None
+    amounts = [
+        (_amount(match.group(1), match.group(2) or inferred_unit), match.group(0))
+        for match in amount_matches
+    ]
     budget_requested = context.get("awaiting_field") == "budget"
     budget_no_match = context.get("budget_no_match", False)
     has_budget_marker = any(term in lowered for term in ("budget", "under", "below", "less than", "up to", "within", "around", "between", "price", "cost", "pkr", "rupee", "rs."))
@@ -151,7 +164,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     if any(term in lowered for term in ("tomorrow", "this week", "next week", "this month", "next month", "soon", "within")):
         context["timeline"] = text[:160]
 
-    if any(word in lowered for word in ("human", "agent", "salesperson", "call me")):
+    if _requests_human(lowered):
         context["intent"] = "human_handoff"
     elif any(word in lowered for word in ("buy", "order", "purchase", "book")):
         context["intent"] = "purchase"
@@ -168,7 +181,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
 
 def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dict[str, Any]:
     lowered = message.casefold()
-    if any(term in lowered for term in ("human", "agent", "salesperson", "call me")):
+    if _requests_human(lowered):
         return {"action": "human_handoff", "reason": "Customer requested a person.", "requires_approval": False}
 
     category = context.get("product_category")
@@ -211,7 +224,7 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
         "question": (
             "I’ll show options without a price filter. Share a maximum budget anytime to narrow the list."
             if context.get("budget_prompt_skipped") else
-            None if context.get("budget_max_pkr") or context.get("budget_flexible") else
+            None if context.get("budget_max_pkr") or context.get("budget_flexible") or context.get("result_limit") or context.get("price_order") else
             "Do you have a budget range in mind?"
         ),
     }

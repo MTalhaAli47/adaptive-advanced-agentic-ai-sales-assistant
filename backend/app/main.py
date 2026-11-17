@@ -117,6 +117,9 @@ def normalize_catalogue_interest(context: dict) -> None:
     interest = context.get("product_category")
     if not interest:
         return
+    if re.search(r"\b(?:talk|speak|chat|connect|call)\b.*\b(?:human|person|agent|sales\s*person|sales\s*rep|representative|employee|staff)\b", interest):
+        context.pop("product_category", None)
+        return
     with connect() as db:
         rows = db.execute("SELECT category,name FROM products WHERE active=1").fetchall()
     vocabulary = {word.casefold() for row in rows for field in ("category", "name") for word in re.findall(r"[a-z0-9]+", row[field].casefold())}
@@ -213,6 +216,19 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
     normalize_catalogue_interest(context)
     stage = stage_after_message(context, row["sales_stage"])
     action = choose_next_action(context, stage, payload.message)
+    if row["handoff_requested"] and action["action"] != "human_handoff":
+        action = {"action": "awaiting_salesperson", "reason": "A salesperson is handling this conversation."}
+        reply = "I’ve added your message to the conversation. A salesperson will reply here."
+        stamp = now()
+        with connect() as db:
+            db.execute("INSERT INTO messages VALUES(?,?,?,?,?)", (str(uuid4()), customer_id, "customer", payload.message, stamp))
+            db.execute("INSERT INTO messages VALUES(?,?,?,?,?)", (str(uuid4()), customer_id, "assistant", reply, now()))
+            db.execute(
+                "UPDATE customers SET context_json=?, sales_stage='human_handoff', handoff_requested=1 WHERE id=?",
+                (json.dumps(context), customer_id),
+            )
+        return ConversationReply(customer_id=customer_id, reply=reply, sales_stage="human_handoff", context=context,
+                                 next_action=action, handoff_required=True)
     if action["action"] == "discover":
         categories = catalogue_categories()
         action["available_categories"] = categories

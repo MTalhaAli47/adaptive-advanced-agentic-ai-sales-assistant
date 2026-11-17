@@ -92,4 +92,5 @@ test('New chat clears the active identity, ignores a pending old-history respons
   assert.match(ui.box.textContent, /Fresh response/);
   await ui.poll();
   assert.match(ui.box.textContent, /Salesperson: A salesperson is here/);
+  assert.equal(ui.box.children.at(-1).className, 'bubble salesperson');
 });
