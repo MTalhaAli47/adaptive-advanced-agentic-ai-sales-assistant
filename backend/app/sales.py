@@ -25,6 +25,15 @@ def _category(text: str) -> str | None:
         return "solar"
     if re.search(r"\bsoftware|crm|sales plan\b", text):
         return "software"
+    request = re.search(
+        r"\b(?:i need|i want|looking for|search for|do you have|do you sell|sell me|show me|recommend(?: me)?|looking to buy|buy)\s+(?:a|an|some|any|the)?\s*([a-z0-9][a-z0-9 -]{1,48})",
+        text,
+    )
+    if request:
+        interest = request.group(1).strip(" .?!,")
+        interest = re.sub(r"\b(please|for me|today|now)\b", "", interest).strip()
+        if interest and interest not in {"something", "anything", "one", "some"}:
+            return interest
     return None
 
 
@@ -49,6 +58,23 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("gpu_model", None)
         context.pop("minimum_ram_gb", None)
         context.pop("minimum_vram_gb", None)
+        context.pop("result_limit", None)
+        context.pop("price_order", None)
+
+    count_names = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    count_match = re.search(r"\b(?:show|give|list)\s+(?:me\s+)?(?:only\s+)?(\d{1,2}|one|two|three|four|five)\s+(?:\w+\s+)?(?:products?|items?|laptops?|options?|results?)\b", lowered)
+    if count_match:
+        value = count_match.group(1)
+        context["result_limit"] = int(value) if value.isdigit() else count_names[value]
+    elif any(term in lowered for term in ("cheapest", "lowest price", "least expensive")):
+        context["price_order"] = "ASC"
+        context["result_limit"] = 1
+    elif any(term in lowered for term in ("most expensive", "highest price")):
+        context["price_order"] = "DESC"
+        context["result_limit"] = 1
+    elif any(term in lowered for term in ("show all", "all options", "show more")):
+        context.pop("result_limit", None)
+        context["price_order"] = "ASC"
 
     gpu = re.search(r"\brtx\s*(5070\s*ti|5060|5070|5080|5090)\b", lowered)
     if gpu:
@@ -68,6 +94,11 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context["use_case"] = "office and everyday tasks"
 
     budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\brtx\s*(?:5060|5070\s*ti|5070|5080|5090)\b", " ", budget_text, flags=re.IGNORECASE)
+    budget_text = re.sub(
+        r"\b(?:show|give|list)\s+(?:me\s+)?(?:only\s+)?(?:\d{1,2}|one|two|three|four|five)\s+(?:\w+\s+)?(?:products?|items?|laptops?|options?|results?)\b",
+        " ", budget_text, flags=re.IGNORECASE,
+    )
     amounts = [(_amount(match.group(1), match.group(2)), match.group(0)) for match in AMOUNT_RE.finditer(budget_text)]
     budget_requested = context.get("awaiting_field") == "budget"
     budget_no_match = context.get("budget_no_match", False)
@@ -147,7 +178,7 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
         return {
             "action": "discover",
             "reason": "No product category has been identified yet.",
-            "question": "What are you looking for—laptops, solar, software, or something else?",
+            "question": "What product or service are you looking for? I’ll check it against the current catalogue.",
         }
 
     if re.fullmatch(r"\s*(hi|hello|hey|good morning|good afternoon|good evening)[!.\s]*", lowered):

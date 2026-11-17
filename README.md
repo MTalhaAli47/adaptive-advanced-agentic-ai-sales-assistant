@@ -51,3 +51,13 @@ The API is channel-neutral. Do not build separate customer or salesperson backen
 ## Current limits
 
 This is a runnable starter MVP, not a production deployment. WhatsApp transport, Gemini/Ollama adapters, authentication and role permissions, appointment confirmation, CRM synchronization, deployment, and operational monitoring still need implementation. Orders are recorded as pending salesperson approval; payment is not processed. The sample catalogue is placeholder data and should be replaced with the business's approved products and prices. See [the architecture notes](docs/architecture.md) for boundaries and risks.
+
+## Run the test suite
+
+Install development checks and run the broad backend/browser cases from the repository root:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+node --test web/tests/chat.test.js
+```

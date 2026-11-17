@@ -1,4 +1,7 @@
 import json
+import difflib
+import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -14,13 +17,16 @@ from app.sales import choose_next_action, extract_context, stage_after_message
 from app.schemas import AppointmentCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate
 
 settings = get_settings()
-app = FastAPI(title=settings.app_name, version="0.1.0")
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
 
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     initialize_database()
+    yield
+
+
+app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -63,19 +69,18 @@ def get_customer_row(customer_id: str):
 
 def catalogue_matches(context: dict) -> list[dict]:
     category = context.get("product_category")
-    use_case = (context.get("use_case") or "").casefold()
-    if category == "laptops":
-        if "office" in use_case:
-            category_filter = "category = 'Office Laptops'"
-        elif "gaming" in use_case or "3d" in use_case or "ai" in use_case:
-            category_filter = "category = 'Gaming Laptops'"
-        else:
-            category_filter = "category IN ('Gaming Laptops','Office Laptops')"
-    else:
-        category_filter = "category LIKE ?"
-
-    query = f"SELECT id,name,description,category,price,currency,brand,ram_gb,gpu_model,vram_gb,storage_gb,condition FROM products WHERE active=1 AND {category_filter}"
-    params: list = [] if category == "laptops" else [f"%{category or ''}%"]
+    query = "SELECT id,name,description,category,price,currency,brand,ram_gb,gpu_model,vram_gb,storage_gb,condition FROM products WHERE active=1"
+    params: list = []
+    ignored = {"a", "an", "the", "some", "any", "i", "need", "want", "looking", "search", "for", "do", "you", "have", "sell", "show", "me", "recommend", "please", "product", "products", "item", "items"}
+    interest_terms = [term.rstrip("s") if len(term) > 3 and term.endswith("s") else term for term in re.findall(r"[a-z0-9]+", category or "") if term not in ignored]
+    for term in interest_terms:
+        query += " AND (category LIKE ? OR name LIKE ? OR description LIKE ?)"
+        params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
+    for term in re.findall(r"[a-z0-9]+", (context.get("use_case") or "").casefold()):
+        if term in {"and", "or", "the", "workloads", "everyday", "tasks"}:
+            continue
+        query += " AND (name LIKE ? OR description LIKE ? OR category LIKE ?)"
+        params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
     minimum = context.get("budget_min_pkr")
     maximum = context.get("budget_max_pkr")
     gpu_model = context.get("gpu_model")
@@ -94,25 +99,56 @@ def catalogue_matches(context: dict) -> list[dict]:
     if maximum is not None:
         query += " AND price <= ?"
         params.append(maximum)
-    query += " ORDER BY price ASC LIMIT 5"
+    price_order = "DESC" if context.get("price_order") == "DESC" else "ASC"
+    limit = max(1, min(10, int(context.get("result_limit", 5))))
+    query += f" ORDER BY price {price_order} LIMIT ?"
+    params.append(limit)
     with connect() as db:
         return [dict(row) for row in db.execute(query, params).fetchall()]
 
 
+def catalogue_categories() -> list[str]:
+    with connect() as db:
+        rows = db.execute("SELECT DISTINCT category FROM products WHERE active=1 ORDER BY category").fetchall()
+    return [row["category"] for row in rows]
+
+
+def normalize_catalogue_interest(context: dict) -> None:
+    interest = context.get("product_category")
+    if not interest:
+        return
+    with connect() as db:
+        rows = db.execute("SELECT category,name FROM products WHERE active=1").fetchall()
+    vocabulary = {word.casefold() for row in rows for field in ("category", "name") for word in re.findall(r"[a-z0-9]+", row[field].casefold())}
+    words = re.findall(r"[a-z0-9]+", interest.casefold())
+    corrected = []
+    for word in words:
+        if word in vocabulary or len(word) < 4:
+            corrected.append(word)
+            continue
+        match = difflib.get_close_matches(word, vocabulary, n=1, cutoff=0.78)
+        corrected.append(match[0] if match else word)
+    normalized = " ".join(corrected)
+    if "laptop" in normalized.split():
+        normalized = "laptops"
+    context["product_category"] = normalized
+
+
 def restore_conversation_context(customer_id: str, context: dict) -> dict:
     """Backfill category/state for conversations created before the state parser."""
-    if context.get("product_category"):
-        return context
     with connect() as db:
         rows = db.execute(
             "SELECT role,content FROM messages WHERE customer_id=? ORDER BY created_at DESC LIMIT 30",
             (customer_id,),
         ).fetchall()
     rows = list(reversed(rows))
-    for item in rows:
-        if item["role"] == "customer":
-            extract_context(item["content"], context)
+    if not context.get("product_category"):
+        for item in rows:
+            if item["role"] == "customer":
+                extract_context(item["content"], context)
     last_assistant = next((item["content"] for item in reversed(rows) if item["role"] == "assistant"), "")
+    if context.get("budget_max_pkr") and any(term in last_assistant.casefold() for term in ("options start at pkr", "within that budget")):
+        context["budget_no_match"] = True
     if "budget" in last_assistant.casefold() and not context.get("budget_max_pkr"):
         context["awaiting_field"] = "budget"
     return context
@@ -174,8 +210,14 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
     context = decode_context(row["context_json"])
     context = restore_conversation_context(customer_id, context)
     context = extract_context(payload.message, context)
+    normalize_catalogue_interest(context)
     stage = stage_after_message(context, row["sales_stage"])
     action = choose_next_action(context, stage, payload.message)
+    if action["action"] == "discover":
+        categories = catalogue_categories()
+        action["available_categories"] = categories
+        if categories:
+            action["question"] = f"What product or service are you looking for? The catalogue currently includes {', '.join(categories)}. I can check other items too."
     if action["action"] == "recommend":
         products = catalogue_matches(context)
         action["products"] = products
@@ -280,6 +322,12 @@ def sales_workspace() -> dict:
         with connect() as db:
             messages = db.execute("SELECT role,content,created_at FROM messages WHERE customer_id=? ORDER BY created_at DESC LIMIT 1", (customer.id,)).fetchone()
             action = choose_next_action(customer.context, customer.sales_stage, customer.context.get("last_customer_message", ""))
+            normalize_catalogue_interest(customer.context)
+            if action["action"] == "discover":
+                categories = catalogue_categories()
+                action["available_categories"] = categories
+                if categories:
+                    action["question"] = f"Catalogue categories: {', '.join(categories)}."
             if action["action"] == "recommend":
                 action["products"] = catalogue_matches(customer.context)
                 if not action["products"]:
