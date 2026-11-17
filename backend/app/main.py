@@ -1,20 +1,24 @@
 import json
 import difflib
+import hashlib
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from app.ai.providers import get_provider
 from app.config import get_settings
 from app.db import connect, decode_context, initialize_database
-from app.sales import choose_next_action, extract_context, stage_after_message
-from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, CartItemCreate, CartItemUpdate, CheckoutCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate
+from app.recommendations import recommend_related_products
+from app.sales import CART_RE, choose_next_action, extract_context, stage_after_message
+from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, CartItemCreate, CartItemUpdate, CheckoutCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate, ProductCreate, ProductRelationshipCreate
 
 settings = get_settings()
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
@@ -27,6 +31,40 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+staff_security = HTTPBasic(auto_error=False)
+
+
+def require_staff(role: str, credentials: HTTPBasicCredentials | None = Depends(staff_security)) -> dict:
+    login_id = settings.admin_login_id if role == "admin" else settings.salesperson_login_id
+    password = settings.admin_login_password if role == "admin" else settings.salesperson_login_password
+    staff_id = "admin-001" if role == "admin" else "sales-001"
+    if not password:
+        if settings.environment.casefold() == "production":
+            raise HTTPException(status_code=503, detail=f"Configure {role.upper()}_LOGIN_PASSWORD before using this workspace")
+        return {"id": staff_id, "login_id": login_id, "role": role}
+    username_ok = credentials is not None and secrets.compare_digest(credentials.username, login_id)
+    password_ok = credentials is not None and secrets.compare_digest(credentials.password, password)
+    if not (username_ok and password_ok):
+        raise HTTPException(status_code=401, detail=f"Valid {role} login is required", headers={"WWW-Authenticate": "Basic"})
+    return {"id": staff_id, "login_id": login_id, "role": role}
+
+
+def require_admin(credentials: HTTPBasicCredentials | None = Depends(staff_security)) -> dict:
+    return require_staff("admin", credentials)
+
+
+def require_salesperson(credentials: HTTPBasicCredentials | None = Depends(staff_security)) -> dict:
+    return require_staff("salesperson", credentials)
+
+
+@app.get("/api/v1/admin/identity")
+def admin_identity(staff: dict = Depends(require_admin)) -> dict:
+    return staff
+
+
+@app.get("/api/v1/sales/identity")
+def salesperson_identity(staff: dict = Depends(require_salesperson)) -> dict:
+    return staff
 
 
 @app.get("/")
@@ -63,7 +101,7 @@ def now() -> str:
 
 def customer_from_row(row) -> CustomerOut:
     return CustomerOut(
-        id=row["id"], name=row["name"], contact=row["contact"], channel=row["channel"],
+        id=row["id"], user_id=row["id"], name=row["name"], contact=row["contact"], channel=row["channel"],
         context=decode_context(row["context_json"]), sales_stage=row["sales_stage"],
         handoff_requested=bool(row["handoff_requested"]), created_at=row["created_at"],
     )
@@ -77,9 +115,29 @@ def get_customer_row(customer_id: str):
     return row
 
 
+def verify_customer_token(customer_id: str, token: str | None) -> None:
+    row = get_customer_row(customer_id)
+    token_hash = row["access_token_hash"] if "access_token_hash" in row.keys() else None
+    supplied_hash = hashlib.sha256((token or "").encode()).hexdigest()
+    if not token_hash or not secrets.compare_digest(token_hash, supplied_hash):
+        raise HTTPException(status_code=401, detail="Sign in to this customer profile to view its orders")
+
+
+def serialize_product(row) -> dict:
+    item = dict(row)
+    for field, target, default in (("tags_json", "tags", []), ("attributes_json", "attributes", {}),
+                                   ("use_cases_json", "use_cases", []), ("compatibility_json", "compatibility", {}),
+                                   ("features_json", "features", []), ("suitable_profiles_json", "suitable_profiles", [])):
+        try:
+            item[target] = json.loads(item.pop(field, "") or json.dumps(default))
+        except (TypeError, ValueError):
+            item[target] = default
+    return item
+
+
 def catalogue_matches(context: dict) -> list[dict]:
     category = context.get("product_category")
-    query = "SELECT id,name,description,category,price,currency,brand,ram_gb,gpu_model,vram_gb,storage_gb,condition FROM products WHERE active=1"
+    query = "SELECT * FROM products WHERE active=1"
     params: list = []
     ignored = {"a", "an", "the", "some", "any", "i", "need", "want", "looking", "search", "for", "do", "you", "have", "sell", "show", "me", "recommend", "please", "product", "products", "item", "items"}
     interest_terms = [term.rstrip("s") if len(term) > 3 and term.endswith("s") else term for term in re.findall(r"[a-z0-9]+", category or "") if term not in ignored]
@@ -138,11 +196,31 @@ def recommended_products(context: dict) -> list[dict]:
     placeholders = ",".join("?" for _ in ids)
     with connect() as db:
         rows = db.execute(
-            f"SELECT id,name,description,category,price,currency,brand,ram_gb,gpu_model,vram_gb,storage_gb,condition FROM products WHERE active=1 AND id IN ({placeholders})",
+            f"SELECT * FROM products WHERE active=1 AND id IN ({placeholders})",
             ids,
         ).fetchall()
     by_id = {row["id"]: dict(row) for row in rows}
     return [by_id[item_id] for item_id in ids if item_id in by_id]
+
+
+def related_for_products(products: list[dict], context: dict, limit: int = 4, exclude_ids: set[str] | None = None) -> list[dict]:
+    if not products:
+        return []
+    with connect() as db:
+        candidates = [dict(row) for row in db.execute("SELECT * FROM products WHERE active=1", ()).fetchall()]
+        links = [dict(row) for row in db.execute("SELECT * FROM product_relationships WHERE active=1", ()).fetchall()]
+    output, seen = [], set()
+    for main in products[:3]:
+        product_links = [link for link in links if link["main_product_id"] == main["id"]]
+        for item in recommend_related_products(main, candidates, context, product_links, limit=limit):
+            related_id = item["related_product"]["id"]
+            if related_id in (exclude_ids or set()):
+                continue
+            if related_id not in seen:
+                seen.add(related_id)
+                output.append(item)
+    output.sort(key=lambda item: -item["relevance_score"])
+    return output[:limit]
 
 
 def select_order_product(products: list[dict], message: str, context: dict) -> dict | None:
@@ -221,18 +299,29 @@ def health() -> dict:
 @app.post("/api/v1/customers", response_model=CustomerOut, status_code=201)
 def create_customer(payload: CustomerCreate) -> CustomerOut:
     customer_id, created = str(uuid4()), now()
+    customer_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(customer_token.encode()).hexdigest()
     with connect() as db:
         db.execute(
-            "INSERT INTO customers(id,name,contact,channel,created_at) VALUES(?,?,?,?,?)",
-            (customer_id, payload.name, payload.contact, payload.channel, created),
+            "INSERT INTO customers(id,name,contact,channel,access_token_hash,created_at) VALUES(?,?,?,?,?,?)",
+            (customer_id, payload.name, payload.contact, payload.channel, token_hash, created),
         )
         row = db.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
-    return customer_from_row(row)
+    return customer_from_row(row).model_copy(update={"customer_token": customer_token})
 
 
 @app.get("/api/v1/customers/{customer_id}", response_model=CustomerOut)
 def read_customer(customer_id: str) -> CustomerOut:
     return customer_from_row(get_customer_row(customer_id))
+
+
+@app.get("/api/v1/customers/{customer_id}/orders")
+def customer_orders(customer_id: str, x_customer_token: str | None = Header(default=None)) -> list[dict]:
+    verify_customer_token(customer_id, x_customer_token)
+    with connect() as db:
+        rows = db.execute("""SELECT o.id,o.customer_id,o.customer_id AS user_id,o.product_id,o.quantity,o.status,o.payment_status,o.fulfillment_status,o.payment_method,o.created_at,o.updated_at,p.name AS product_name,p.price,p.currency
+            FROM orders o JOIN products p ON p.id=o.product_id WHERE o.customer_id=? ORDER BY o.created_at DESC""", (customer_id,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/v1/customers", response_model=list[CustomerOut])
@@ -250,11 +339,93 @@ def list_products(q: str = "") -> list[dict]:
             rows = db.execute("SELECT * FROM products WHERE active=1 AND (name LIKE ? OR description LIKE ? OR category LIKE ?) ORDER BY name", (term, term, term)).fetchall()
         else:
             rows = db.execute("SELECT * FROM products WHERE active=1 ORDER BY name").fetchall()
+    return [serialize_product(row) for row in rows]
+
+
+@app.get("/api/v1/products/{product_id}/related")
+def get_related_products(product_id: str, customer_id: str | None = None) -> dict:
+    with connect() as db:
+        main_row = db.execute("SELECT * FROM products WHERE id=? AND active=1", (product_id,)).fetchone()
+        if not main_row:
+            raise HTTPException(status_code=404, detail="Product not found")
+        products = [dict(row) for row in db.execute("SELECT * FROM products WHERE active=1", ()).fetchall()]
+        links = [dict(row) for row in db.execute("SELECT * FROM product_relationships WHERE main_product_id=? AND active=1", (product_id,)).fetchall()]
+        context = {}
+        if customer_id:
+            customer = db.execute("SELECT context_json FROM customers WHERE id=?", (customer_id,)).fetchone()
+            if customer:
+                context = decode_context(customer["context_json"])
+    return {"main_product": serialize_product(main_row), "recommendations": recommend_related_products(dict(main_row), products, context, links)}
+
+
+@app.get("/api/v1/admin/products")
+def admin_products(staff: dict = Depends(require_admin)) -> list[dict]:
+    with connect() as db:
+        rows = db.execute("SELECT * FROM products ORDER BY active DESC,category,name").fetchall()
+    return [serialize_product(row) for row in rows]
+
+
+@app.post("/api/v1/admin/products", status_code=201)
+def add_product(payload: ProductCreate, staff: dict = Depends(require_admin)) -> dict:
+    product_id = payload.id or re.sub(r"[^a-z0-9]+", "-", payload.name.casefold()).strip("-")[:100]
+    fields = ("subcategory", "tags", "attributes", "price_tier", "use_cases", "performance_level", "compatibility", "features", "suitable_profiles")
+    values = {field: getattr(payload, field) for field in fields}
+    try:
+        with connect() as db:
+            db.execute(
+                """INSERT INTO products(id,name,description,category,price,currency,active,subcategory,tags_json,attributes_json,price_tier,use_cases_json,performance_level,compatibility_json,features_json,suitable_profiles_json,created_by_user_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (product_id,payload.name,payload.description,payload.category,payload.price,payload.currency,int(payload.active),values["subcategory"],json.dumps(values["tags"]),json.dumps(values["attributes"]),values["price_tier"],json.dumps(values["use_cases"]),values["performance_level"],json.dumps(values["compatibility"]),json.dumps(values["features"]),json.dumps(values["suitable_profiles"]),staff["id"]),
+            )
+            row = db.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    except Exception as exc:
+        if "UNIQUE" in str(exc):
+            raise HTTPException(status_code=409, detail="A product with that ID already exists") from exc
+        raise
+    return serialize_product(row)
+
+
+@app.delete("/api/v1/admin/products/{product_id}")
+def remove_product(product_id: str, staff: dict = Depends(require_admin)) -> dict:
+    with connect() as db:
+        result = db.execute("UPDATE products SET active=0 WHERE id=? AND active=1", (product_id,))
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Active product not found")
+    return {"id": product_id, "active": False, "message": "Product removed from the active catalogue."}
+
+
+@app.get("/api/v1/admin/product-relationships")
+def list_product_relationships(staff: dict = Depends(require_admin)) -> list[dict]:
+    with connect() as db:
+        rows = db.execute("""SELECT r.*,m.name AS main_product_name,p.name AS related_product_name
+            FROM product_relationships r JOIN products m ON m.id=r.main_product_id
+            JOIN products p ON p.id=r.related_product_id ORDER BY m.name,p.name""").fetchall()
     return [dict(row) for row in rows]
 
 
+@app.post("/api/v1/admin/product-relationships", status_code=201)
+def create_product_relationship(payload: ProductRelationshipCreate, staff: dict = Depends(require_admin)) -> dict:
+    relationship_id = str(uuid4())
+    with connect() as db:
+        for product_id in (payload.main_product_id, payload.related_product_id):
+            if not db.execute("SELECT id FROM products WHERE id=? AND active=1", (product_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="Both products must be active catalogue entries")
+        db.execute("INSERT INTO product_relationships(id,main_product_id,related_product_id,relationship_type,weight,note,created_by_user_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(main_product_id,related_product_id,relationship_type) DO UPDATE SET weight=excluded.weight,note=excluded.note,active=1,created_by_user_id=excluded.created_by_user_id", (relationship_id,payload.main_product_id,payload.related_product_id,payload.relationship_type,payload.weight,payload.note,staff["id"]))
+        row = db.execute("SELECT * FROM product_relationships WHERE main_product_id=? AND related_product_id=? AND relationship_type=?", (payload.main_product_id,payload.related_product_id,payload.relationship_type)).fetchone()
+    return dict(row)
+
+
+@app.delete("/api/v1/admin/product-relationships/{relationship_id}")
+def remove_product_relationship(relationship_id: str, staff: dict = Depends(require_admin)) -> dict:
+    with connect() as db:
+        result = db.execute("DELETE FROM product_relationships WHERE id=?", (relationship_id,))
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Relationship not found")
+    return {"id": relationship_id, "deleted": True}
+
+
 @app.get("/api/v1/dashboard/summary")
-def dashboard_summary() -> dict:
+def dashboard_summary(staff: dict = Depends(require_salesperson)) -> dict:
     with connect() as db:
         counts = db.execute("SELECT COUNT(*) AS leads, SUM(CASE WHEN handoff_requested=1 THEN 1 ELSE 0 END) AS handoffs FROM customers").fetchone()
         stages = db.execute("SELECT sales_stage,COUNT(*) AS count FROM customers GROUP BY sales_stage").fetchall()
@@ -264,7 +435,7 @@ def dashboard_summary() -> dict:
 
 
 @app.post("/api/v1/conversations/{customer_id}/messages", response_model=ConversationReply)
-def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
+def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | None = Header(default=None)) -> ConversationReply:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
     context = restore_conversation_context(customer_id, context)
@@ -272,7 +443,29 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
     normalize_catalogue_interest(context)
     stage = stage_after_message(context, row["sales_stage"])
     action = choose_next_action(context, stage, payload.message)
-    if row["handoff_requested"] and action["action"] != "place_order":
+    human_requested_this_turn = action["action"] in {"human_handoff", "payment_help"}
+    direct_reply = None
+    cart_added = None
+    if CART_RE.search(payload.message) or action["action"] == "add_to_cart":
+        cart_candidates = recommended_products(context)
+        cart_product = select_order_product(cart_candidates, payload.message, context)
+        if cart_product:
+            with connect() as db:
+                existing_cart_item = db.execute("SELECT quantity FROM cart_items WHERE customer_id=? AND product_id=?", (customer_id, cart_product["id"])).fetchone()
+                new_quantity = min(100, (existing_cart_item["quantity"] if existing_cart_item else 0) + 1)
+                db.execute("INSERT INTO cart_items(customer_id,product_id,quantity,updated_at) VALUES(?,?,?,?) ON CONFLICT(customer_id,product_id) DO UPDATE SET quantity=excluded.quantity,updated_at=excluded.updated_at", (customer_id, cart_product["id"], new_quantity, now()))
+            cart_added = cart_product
+            if action["action"] == "add_to_cart":
+                action = {"action": "cart_item_added", "product": cart_product, "quantity": new_quantity, "reason": "Added the selected catalogue product to the customer's cart."}
+                direct_reply = f"Added {cart_product['name']} to your cart. You can review it on the Cart page. Would you also like a salesperson to confirm availability?"
+        else:
+            action = {"action": "select_product", "reason": "More than one product could match the cart request.", "products": cart_candidates, "question": "Which product should I add? Reply with the model name or option number."}
+            context["awaiting_field"] = "cart_product_selection"
+            if human_requested_this_turn:
+                context["handoff_reason"] = "Customer requested an availability confirmation while selecting a cart item."
+                direct_reply = f"{action['question']} I’ll also keep your availability request in the salesperson queue."
+    self_service_actions = {"place_order", "create_appointment", "clarify_appointment", "recommend", "answer", "clarify_use", "clarify_budget", "track_order", "add_to_cart", "related_recommendations", "select_product", "cancel_order_request", "smalltalk", "apology", "greet", "discover", "no_match", "cart_item_added", "appointment_created"}
+    if row["handoff_requested"] and action["action"] not in self_service_actions | {"human_handoff", "payment_help"}:
         context.pop("awaiting_field", None)
         action = {"action": "awaiting_salesperson", "reason": "A salesperson is handling this conversation."}
         reply = "I’ve added your message to the conversation. A salesperson will reply here."
@@ -286,6 +479,60 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
             )
         return ConversationReply(customer_id=customer_id, reply=reply, sales_stage="human_handoff", context=context,
                                  next_action=action, handoff_required=True)
+    if action["action"] == "track_order":
+        verify_customer_token(customer_id, x_customer_token)
+        with connect() as db:
+            orders = db.execute("""SELECT o.id,o.status,o.payment_status,o.fulfillment_status,o.quantity,o.created_at,p.name AS product_name,p.price,p.currency
+                FROM orders o JOIN products p ON p.id=o.product_id WHERE o.customer_id=? ORDER BY o.created_at DESC""", (customer_id,)).fetchall()
+        reference = re.search(r"\b([a-f0-9]{8,36})\b", payload.message, re.IGNORECASE)
+        if reference:
+            prefix = reference.group(1).casefold()
+            matches = [dict(order) for order in orders if order["id"].casefold().startswith(prefix)]
+            if matches:
+                order = matches[0]
+                direct_reply = f"Order {order['id'][:8]} for {order['product_name']}: {order['status'].replace('_',' ')}, payment {order['payment_status'].replace('_',' ')}, delivery {order['fulfillment_status'].replace('_',' ')}."
+            else:
+                direct_reply = f"I couldn’t find an order matching {prefix} in your account. Here are your recent orders: " + (", ".join(f"{o['id'][:8]} — {o['product_name']}" for o in orders[:5]) if orders else "there are no orders on this account yet.")
+        elif orders:
+            choices = "\n".join(f"• {order['id'][:8]} — {order['product_name']} ({order['status'].replace('_',' ')}, {order['fulfillment_status'].replace('_',' ')})" for order in orders[:5])
+            direct_reply = f"Here are your recent orders. Send the reference to see full status:\n{choices}"
+        else:
+            direct_reply = "There are no orders on this customer profile yet. If you used a different profile, start a chat with that profile or ask a salesperson for help."
+    if action["action"] == "related_recommendations":
+        main_products = recommended_products(context)
+        if not main_products:
+            main_products = catalogue_matches(context)
+        related = related_for_products(main_products, context, exclude_ids=set(context.get("last_recommended_product_ids", [])))
+        action["related_products"] = related
+        action["products"] = main_products
+        if related:
+            lines = []
+            for item in related:
+                product = item["related_product"]
+                price = f"{product.get('currency','PKR')} {int(product['price']):,}" if product.get("price") is not None else "price on request"
+                lines.append(f"• {product['name']} — {price}. {item['reason']} (match {item['relevance_score']:.0%})")
+            direct_reply = "Here are related options from our catalogue:\n" + "\n".join(lines)
+        else:
+            budget_max = context.get("budget_max_pkr")
+            if budget_max is not None and main_products:
+                broader_context = {**context, "budget_min_pkr": None, "budget_max_pkr": None, "budget_flexible": True, "result_limit": 10, "price_order": "ASC"}
+                broader_options = catalogue_matches(broader_context)
+                main_ids = {product["id"] for product in main_products}
+                next_up = min((product for product in broader_options if product["id"] not in main_ids and product.get("price") is not None and product["price"] > budget_max), key=lambda product: product["price"], default=None)
+                if next_up:
+                    context["pending_budget_alternative"] = True
+                    current = main_products[0]
+                    direct_reply = (f"{current['name']} is the only match in your PKR {budget_max:,} maximum. "
+                                    f"The next higher option is {next_up['name']} at PKR {int(next_up['price']):,}, above your budget. "
+                                    "Say ‘show higher options’ if you’d like to compare it.")
+                else:
+                    direct_reply = f"{main_products[0]['name']} is the only match within your PKR {budget_max:,} budget. I don’t have another verified related product for it in the catalogue."
+            elif len(main_products) > 1:
+                direct_reply = f"I’ve already shown all {len(main_products)} current matches in this category. I can compare their specifications or narrow them by price, GPU, memory, or intended use."
+            else:
+                direct_reply = "I don’t have a verified complementary product linked to this item yet. I can still compare other products in the same category if you tell me what matters most."
+    if action["action"] == "human_handoff" and cart_added:
+        direct_reply = f"Added {cart_added['name']} to your cart, and I’ve sent a salesperson your request to confirm availability."
     if action["action"] == "clarify_use":
         starts = laptop_price_starts()
         office = next((price for category, price in starts.items() if "office" in category.casefold()), None)
@@ -303,6 +550,8 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
         products = catalogue_matches(context)
         action["products"] = products
         context["last_recommended_product_ids"] = [product["id"] for product in products]
+        if products:
+            action["related_products"] = related_for_products(products, context, limit=3, exclude_ids={product["id"] for product in products})
         if not products:
             action["action"] = "no_match"
             action["reason"] = "No active catalogue items match the selected category and budget."
@@ -323,7 +572,6 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
     elif action["action"] == "answer":
         action["products"] = catalogue_matches(context)
         context["last_recommended_product_ids"] = [product["id"] for product in action["products"]]
-    direct_reply = None
     if action["action"] == "create_appointment":
         requested_time = context.get("appointment_requested_time")
         if not requested_time:
@@ -348,6 +596,8 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
         context.pop("awaiting_field", None)
         direct_reply = "No problem—I haven’t placed an order. Tell me if you’d like to compare another option."
     if action["action"] == "place_order":
+        if re.search(r"\b(?:another|a new|one more)\s+order\b", payload.message, re.IGNORECASE):
+            context["new_order_requested"] = True
         products = recommended_products(context)
         selected_product = select_order_product(products, payload.message, context)
         if selected_product is None:
@@ -367,7 +617,7 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
             quantity = max(1, min(100, int(quantity_match.group(1)))) if quantity_match else 1
             existing_id = context.get("last_order_id")
             existing = None
-            if existing_id and context.get("last_order_product_id") == selected_product["id"] and not re.search(r"\b(?:another|new|one more)\b", payload.message, re.IGNORECASE):
+            if existing_id and context.get("last_order_product_id") == selected_product["id"] and not context.get("new_order_requested") and not re.search(r"\b(?:another|new|one more)\b", payload.message, re.IGNORECASE):
                 with connect() as db:
                     existing = db.execute("SELECT status FROM orders WHERE id=?", (existing_id,)).fetchone()
             if existing and existing["status"] in {"pending_confirmation", "pending_approval", "confirmed"}:
@@ -385,13 +635,14 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
                 context["last_order_id"] = order_id
                 context["last_order_product_id"] = selected_product["id"]
                 context["last_order_status"] = "pending_confirmation"
+                context.pop("new_order_requested", None)
                 stage = "order_pending_confirmation"
                 action.update({"action": "order_created", "order_id": order_id, "product": selected_product, "quantity": quantity})
                 price = f"PKR {int(selected_product['price']):,}" if selected_product.get("price") is not None else "price to be confirmed"
                 direct_reply = (f"I’ve recorded your order request for {selected_product['name']} × {quantity} ({price}). "
                                 f"It’s awaiting salesperson confirmation; no payment has been taken. Order reference: {order_id[:8]}.")
             context.pop("awaiting_field", None)
-    handoff = action["action"] in {"human_handoff", "payment_help"}
+    handoff = action["action"] in {"human_handoff", "payment_help"} or human_requested_this_turn
     if handoff:
         stage = "human_handoff"
         context["handoff_reason"] = action["reason"]
@@ -412,7 +663,7 @@ def send_message(customer_id: str, payload: MessageIn) -> ConversationReply:
             "UPDATE customers SET context_json=?, sales_stage=?, handoff_requested=? WHERE id=?",
             (json.dumps(context), stage, int(handoff or row["handoff_requested"]), customer_id),
         )
-    return ConversationReply(customer_id=customer_id, reply=reply, sales_stage=stage, context=context, next_action=action, handoff_required=handoff)
+    return ConversationReply(customer_id=customer_id, reply=reply, sales_stage=stage, context=context, next_action=action, handoff_required=bool(handoff or row["handoff_requested"]))
 
 
 @app.get("/api/v1/conversations/{customer_id}")
@@ -424,7 +675,7 @@ def conversation_history(customer_id: str) -> dict:
 
 
 @app.get("/api/v1/sales/handoffs")
-def sales_handoffs() -> dict:
+def sales_handoffs(staff: dict = Depends(require_salesperson)) -> dict:
     with connect() as db:
         rows = db.execute(
             """SELECT c.*, (SELECT content FROM messages m WHERE m.customer_id=c.id
@@ -442,7 +693,7 @@ def sales_handoffs() -> dict:
 
 
 @app.post("/api/v1/sales/{customer_id}/messages")
-def salesperson_message(customer_id: str, payload: MessageIn) -> dict:
+def salesperson_message(customer_id: str, payload: MessageIn, staff: dict = Depends(require_salesperson)) -> dict:
     row = get_customer_row(customer_id)
     if not row["handoff_requested"]:
         raise HTTPException(status_code=409, detail="This conversation is not waiting for a salesperson")
@@ -457,7 +708,7 @@ def salesperson_message(customer_id: str, payload: MessageIn) -> dict:
 
 
 @app.post("/api/v1/sales/{customer_id}/handoff/resolve")
-def resolve_handoff(customer_id: str) -> dict:
+def resolve_handoff(customer_id: str, staff: dict = Depends(require_salesperson)) -> dict:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
     context["handoff_resolved_at"] = now()
@@ -470,7 +721,7 @@ def resolve_handoff(customer_id: str) -> dict:
 
 
 @app.get("/api/v1/sales/{customer_id}/next-action")
-def next_action(customer_id: str) -> dict:
+def next_action(customer_id: str, staff: dict = Depends(require_salesperson)) -> dict:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
     latest = context.get("last_customer_message", "")
@@ -484,7 +735,7 @@ def next_action(customer_id: str) -> dict:
 
 
 @app.post("/api/v1/sales/{customer_id}/handoff")
-def request_handoff(customer_id: str, reason: str = "Salesperson assistance requested") -> dict:
+def request_handoff(customer_id: str, reason: str = "Salesperson assistance requested", staff: dict = Depends(require_salesperson)) -> dict:
     row = get_customer_row(customer_id)
     context = decode_context(row["context_json"])
     context["handoff_reason"] = reason[:500]
@@ -588,7 +839,7 @@ def checkout_cart(customer_id: str, payload: CheckoutCreate) -> dict:
 
 
 @app.get("/api/v1/admin/summary")
-def admin_summary() -> dict:
+def admin_summary(staff: dict = Depends(require_admin)) -> dict:
     with connect() as db:
         row = db.execute(
             """SELECT COUNT(*) AS total,
@@ -609,19 +860,33 @@ def admin_summary() -> dict:
 
 
 @app.get("/api/v1/admin/orders")
-def admin_orders() -> list[dict]:
+def admin_orders(status: str | None = None, payment_status: str | None = None, fulfillment_status: str | None = None, staff: dict = Depends(require_admin)) -> list[dict]:
+    allowed = {
+        "status": {"pending_approval", "pending_confirmation", "confirmed", "cancelled"},
+        "payment_status": {"not_paid", "paid", "refunded"},
+        "fulfillment_status": {"not_started", "processing", "shipped", "delivered", "returned"},
+    }
+    filters = {"status": status, "payment_status": payment_status, "fulfillment_status": fulfillment_status}
+    clauses, values = [], []
+    for column, value in filters.items():
+        if value:
+            if value not in allowed[column]:
+                raise HTTPException(status_code=422, detail=f"Invalid {column} filter")
+            clauses.append(f"o.{column}=?")
+            values.append(value)
     with connect() as db:
         rows = db.execute(
             """SELECT o.*, c.name AS customer_name, c.contact AS customer_contact,
                       p.name AS product_name, p.price AS unit_price, p.currency
                FROM orders o JOIN customers c ON c.id=o.customer_id
-               JOIN products p ON p.id=o.product_id ORDER BY o.created_at DESC"""
+               JOIN products p ON p.id=o.product_id""" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY o.created_at DESC",
+            values,
         ).fetchall()
     return [dict(row) for row in rows]
 
 
 @app.patch("/api/v1/admin/orders/{order_id}")
-def update_admin_order(order_id: str, payload: AdminOrderUpdate) -> dict:
+def update_admin_order(order_id: str, payload: AdminOrderUpdate, staff: dict = Depends(require_admin)) -> dict:
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=422, detail="Provide at least one order field to update")
@@ -644,6 +909,8 @@ def update_admin_order(order_id: str, payload: AdminOrderUpdate) -> dict:
         if "payment_status" in changes:
             assignments.append("payment_updated_at=?")
             values.append(now())
+        assignments.append("updated_by_user_id=?")
+        values.append(staff["id"])
         assignments.append("updated_at=?")
         values.extend((now(), order_id))
         db.execute(f"UPDATE orders SET {', '.join(assignments)} WHERE id=?", values)
@@ -684,7 +951,7 @@ def update_admin_order(order_id: str, payload: AdminOrderUpdate) -> dict:
 
 
 @app.get("/api/v1/admin/appointments")
-def admin_appointments() -> list[dict]:
+def admin_appointments(staff: dict = Depends(require_admin)) -> list[dict]:
     with connect() as db:
         rows = db.execute(
             """SELECT a.*,c.name AS customer_name,c.contact AS customer_contact
@@ -695,16 +962,16 @@ def admin_appointments() -> list[dict]:
 
 
 @app.patch("/api/v1/admin/appointments/{appointment_id}")
-def update_admin_appointment(appointment_id: str, payload: AdminAppointmentUpdate) -> dict:
+def update_admin_appointment(appointment_id: str, payload: AdminAppointmentUpdate, staff: dict = Depends(require_admin)) -> dict:
     changes = payload.model_dump(exclude_unset=True)
     with connect() as db:
         existing = db.execute("SELECT status,customer_id,requested_time FROM appointments WHERE id=?", (appointment_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Appointment not found")
         if "notes" in changes:
-            db.execute("UPDATE appointments SET status=?,notes=? WHERE id=?", (changes["status"], changes["notes"], appointment_id))
+            db.execute("UPDATE appointments SET status=?,notes=?,updated_by_user_id=? WHERE id=?", (changes["status"], changes["notes"], staff["id"], appointment_id))
         else:
-            db.execute("UPDATE appointments SET status=? WHERE id=?", (changes["status"], appointment_id))
+            db.execute("UPDATE appointments SET status=?,updated_by_user_id=? WHERE id=?", (changes["status"], staff["id"], appointment_id))
         updated = db.execute("SELECT * FROM appointments WHERE id=?", (appointment_id,)).fetchone()
         if changes["status"] != existing["status"]:
             customer_row = db.execute("SELECT context_json FROM customers WHERE id=?", (existing["customer_id"],)).fetchone()
@@ -721,7 +988,7 @@ def update_admin_appointment(appointment_id: str, payload: AdminAppointmentUpdat
 
 
 @app.get("/api/v1/sales/workspace")
-def sales_workspace() -> dict:
+def sales_workspace(staff: dict = Depends(require_salesperson)) -> dict:
     customers = list_customers()
     items = []
     for customer in customers:
@@ -740,4 +1007,4 @@ def sales_workspace() -> dict:
                     action["action"] = "no_match"
                     action["reason"] = "No active catalogue items match the selected category and budget."
         items.append({"customer": customer.model_dump(), "last_message": dict(messages) if messages else None, "next_action": action})
-    return {"conversations": items}
+    return {"conversations": items, "staff": staff}

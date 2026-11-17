@@ -3,11 +3,14 @@
   const money = (amount, currency = 'PKR') => `${currency} ${Number(amount || 0).toLocaleString()}`;
   async function ensureCustomer() {
     let id = localStorage.getItem('aisa_customer_id');
-    if (id) return id;
+    if (id && localStorage.getItem('aisa_customer_token')) return id;
+    if (id) localStorage.removeItem('aisa_customer_id');
     const name = prompt('What name should we use for your order?') || 'Website visitor';
     const response = await fetch(`${API}/customers`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, channel:'web'}) });
     if (!response.ok) throw new Error('Could not create your customer profile. Please refresh and try again.');
-    id = (await response.json()).id;
+    const customer = await response.json();
+    id = customer.id;
+    if (customer.customer_token) localStorage.setItem('aisa_customer_token', customer.customer_token);
     localStorage.setItem('aisa_customer_id', id);
     return id;
   }

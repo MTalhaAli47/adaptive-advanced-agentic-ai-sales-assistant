@@ -4,9 +4,15 @@ function getCustomer() {
   return localStorage.getItem('aisa_customer_id');
 }
 
+function showCustomerId(id) {
+  const element = document.querySelector('#customer-profile');
+  if (element) element.textContent = id ? `Your profile ID: ${id}. Order tracking is limited to orders on this profile.` : '';
+}
+
 async function ensureCustomer() {
   const existing = getCustomer();
-  if (existing) return existing;
+  if (existing && localStorage.getItem('aisa_customer_token')) { showCustomerId(existing); return existing; }
+  if (existing) localStorage.removeItem('aisa_customer_id');
   const name = prompt('What name should we use?') || 'Website visitor';
   const response = await fetch(`${API}/customers`, {
     method: 'POST',
@@ -15,6 +21,8 @@ async function ensureCustomer() {
   });
   const customer = await response.json();
   localStorage.setItem('aisa_customer_id', customer.id);
+  if (customer.customer_token) localStorage.setItem('aisa_customer_token', customer.customer_token);
+  showCustomerId(customer.user_id || customer.id);
   return customer.id;
 }
 
@@ -28,6 +36,7 @@ function addBubble(box, role, text) {
 
 async function setupChat(form, box) {
   const saved = getCustomer();
+  if (saved && localStorage.getItem('aisa_customer_token')) showCustomerId(saved);
   const seenSalesMessages = new Set();
   if (saved) {
     try {
@@ -66,14 +75,14 @@ async function setupChat(form, box) {
       const customerId = await ensureCustomer();
       const response = await fetch(`${API}/conversations/${encodeURIComponent(customerId)}/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Customer-Token': localStorage.getItem('aisa_customer_token') || '' },
         body: JSON.stringify({ message: text }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Request failed');
       addBubble(box, 'assistant', result.reply);
-    } catch {
-      addBubble(box, 'assistant', 'I could not reach the service. Please try again shortly.');
+    } catch (error) {
+      addBubble(box, 'assistant', error.message || 'I could not reach the service. Please try again shortly.');
     }
   });
 }
@@ -88,6 +97,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (newChat) {
       newChat.addEventListener('click', () => {
         localStorage.removeItem('aisa_customer_id');
+        localStorage.removeItem('aisa_customer_token');
+        showCustomerId(null);
         box.replaceChildren();
         addBubble(box, 'assistant', 'New conversation started. What are you looking for today?');
       });
@@ -112,6 +123,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (widgetNewChat) {
       widgetNewChat.addEventListener('click', () => {
         localStorage.removeItem('aisa_customer_id');
+        localStorage.removeItem('aisa_customer_token');
+        showCustomerId(null);
         const widgetBox = widget.querySelector('.chat-box');
         widgetBox.replaceChildren();
         addBubble(widgetBox, 'assistant', 'New conversation started. What are you looking for today?');

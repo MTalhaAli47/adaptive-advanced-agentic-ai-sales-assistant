@@ -11,7 +11,7 @@ test('Admin order page renders confirmation, payment, fulfillment, and escaped c
 
   const elements = new Map();
   const getElement = selector => {
-    if (!elements.has(selector)) elements.set(selector, { innerHTML: '', textContent: '', listeners: {}, addEventListener(type, callback) { this.listeners[type] = callback; } });
+    if (!elements.has(selector)) elements.set(selector, { innerHTML: '', textContent: '', listeners: {}, addEventListener(type, callback) { this.listeners[type] = callback; }, querySelectorAll() { return []; } });
     return elements.get(selector);
   };
   const order = {
@@ -26,11 +26,15 @@ test('Admin order page renders confirmation, payment, fulfillment, and escaped c
       querySelector: getElement,
       querySelectorAll: () => [],
     },
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     fetch: async url => {
       requests.push(url);
+      if (url.endsWith('/admin/identity')) return { ok: true, status: 200, json: async () => ({ id: 'admin-001', login_id: 'admin' }) };
       if (url.endsWith('/admin/summary')) return { ok: true, json: async () => ({ total: 1, awaiting_confirmation: 1, confirmed: 0, not_paid: 1, paid: 0, delivered: 0, appointments_requested: 1, appointments_confirmed: 0 }) };
       if (url.endsWith('/admin/orders')) return { ok: true, json: async () => [order] };
       if (url.endsWith('/admin/appointments')) return { ok: true, json: async () => [{ id: 'appointment-1', customer_name: 'Amina', requested_time: 'Friday 3pm', status: 'requested' }] };
+      if (url.endsWith('/admin/products')) return { ok: true, json: async () => [] };
+      if (url.endsWith('/admin/product-relationships')) return { ok: true, json: async () => [] };
       throw new Error(`Unexpected request: ${url}`);
     },
     console, Date, Number, encodeURIComponent,

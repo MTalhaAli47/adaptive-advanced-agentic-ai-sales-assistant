@@ -11,6 +11,7 @@ class CustomerCreate(BaseModel):
 
 class CustomerOut(BaseModel):
     id: str
+    user_id: str | None = None
     name: str
     contact: str | None
     channel: str
@@ -18,6 +19,7 @@ class CustomerOut(BaseModel):
     sales_stage: str
     handoff_requested: bool
     created_at: str
+    customer_token: str | None = None
 
 
 class MessageIn(BaseModel):
@@ -67,6 +69,33 @@ class CartItemUpdate(BaseModel):
 
 class CheckoutCreate(BaseModel):
     payment_method: Literal["cash_on_delivery", "bank_transfer"]
+
+
+class ProductCreate(BaseModel):
+    id: str | None = Field(default=None, min_length=2, max_length=120)
+    name: str = Field(min_length=2, max_length=200)
+    description: str = Field(default="", max_length=4000)
+    category: str = Field(min_length=2, max_length=100)
+    subcategory: str | None = Field(default=None, max_length=100)
+    price: float | None = Field(default=None, ge=0)
+    currency: str = Field(default="PKR", min_length=3, max_length=3)
+    tags: list[str] = Field(default_factory=list, max_length=40)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    price_tier: Literal["budget", "mid_range", "premium"] | None = None
+    use_cases: list[str] = Field(default_factory=list, max_length=30)
+    performance_level: str | None = Field(default=None, max_length=60)
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+    features: list[str] = Field(default_factory=list, max_length=50)
+    suitable_profiles: list[str] = Field(default_factory=list, max_length=30)
+    active: bool = True
+
+
+class ProductRelationshipCreate(BaseModel):
+    main_product_id: str
+    related_product_id: str
+    relationship_type: Literal["accessory", "complementary", "frequently_bought_together", "upgrade", "alternative", "essential_companion", "consumable", "use_case"]
+    weight: float = Field(default=1.0, ge=0, le=1)
+    note: str | None = Field(default=None, max_length=500)
 
 
 class AdminOrderUpdate(BaseModel):

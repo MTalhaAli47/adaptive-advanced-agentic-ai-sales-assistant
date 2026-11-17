@@ -12,6 +12,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./test.db")
     monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("ADMIN_LOGIN_PASSWORD", "")
+    monkeypatch.setenv("SALESPERSON_LOGIN_PASSWORD", "")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     get_settings.cache_clear()
     from app.main import app
@@ -264,6 +267,7 @@ def test_order_request_creates_pending_order_and_admin_can_confirm_and_record_pa
     confirmed = client.patch(f"/api/v1/admin/orders/{order_id}", json={"status": "confirmed"})
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed_at"] is not None
+    assert confirmed.json()["updated_by_user_id"] == "admin-001"
     assert client.get(f"/api/v1/conversations/{customer_id}").json()["messages"][-1]["role"] == "salesperson"
     paid = client.patch(f"/api/v1/admin/orders/{order_id}", json={"payment_status": "paid", "payment_method": "bank transfer", "payment_reference": "verified-ref-1"})
     assert paid.json()["payment_status"] == "paid"
@@ -357,6 +361,7 @@ def test_customer_can_request_appointment_and_admin_can_confirm_it(client):
     confirmed = client.patch(f"/api/v1/admin/appointments/{appointment_id}", json={"status": "confirmed"})
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "confirmed"
+    assert confirmed.json()["updated_by_user_id"] == "admin-001"
     history = client.get(f"/api/v1/conversations/{customer_id}").json()["messages"]
     assert history[-1]["role"] == "salesperson"
     assert "confirmed your appointment" in history[-1]["content"]
@@ -426,6 +431,113 @@ def test_cart_and_checkout_pages_are_available(client):
     assert 'id="checkout-button"' in response.text
     assert "/assets/store.js" in response.text
     assert 'href="/cart"' in client.get("/").text
+
+
+def test_customer_order_history_is_limited_to_its_private_customer_token(client):
+    first = client.post("/api/v1/customers", json={"name": "First", "channel": "web"}).json()
+    second = client.post("/api/v1/customers", json={"name": "Second", "channel": "web"}).json()
+    created = client.post(f"/api/v1/orders/{first['id']}", json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    unauthenticated = client.get(f"/api/v1/customers/{first['id']}/orders")
+    assert unauthenticated.status_code == 401
+    cross_account = client.get(f"/api/v1/customers/{first['id']}/orders", headers={"X-Customer-Token": second["customer_token"]})
+    assert cross_account.status_code == 401
+    own_orders = client.get(f"/api/v1/customers/{first['id']}/orders", headers={"X-Customer-Token": first["customer_token"]})
+    assert [order["id"] for order in own_orders.json()] == [created["id"]]
+    assert first["user_id"] == first["id"]
+
+
+def test_chat_order_tracking_requires_private_token_and_lists_only_owned_orders(client):
+    customer = client.post("/api/v1/customers", json={"name": "Order tracker", "channel": "web"}).json()
+    order = client.post(f"/api/v1/orders/{customer['id']}", json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    denied = client.post(f"/api/v1/conversations/{customer['id']}/messages", json={"message": "track my order"})
+    assert denied.status_code == 401
+    response = client.post(f"/api/v1/conversations/{customer['id']}/messages", headers={"X-Customer-Token": customer["customer_token"]}, json={"message": "track my order"}).json()
+    assert order["id"][:8] in response["reply"]
+    assert "pending confirmation" in response["reply"]
+
+
+def test_live_handoff_does_not_block_new_product_search_or_appointment(client):
+    customer = client.post("/api/v1/customers", json={"name": "Handoff recovery", "channel": "web"}).json()
+    customer_id = customer["id"]
+    client.post(f"/api/v1/sales/{customer_id}/handoff")
+    product = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a gaming laptop"}).json()
+    assert product["next_action"]["action"] == "recommend"
+    assert product["handoff_required"] is True
+    appointment = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need an appointment Monday at 3pm"}).json()
+    assert appointment["next_action"]["action"] == "appointment_created"
+    records = client.get("/api/v1/admin/appointments").json()
+    assert any(item["customer_id"] == customer_id and item["requested_time"] == "Monday at 3pm" for item in records)
+
+
+def test_chat_can_add_last_recommended_product_to_cart_while_requesting_staff(client):
+    customer = client.post("/api/v1/customers", json={"name": "Cart and staff", "channel": "web"}).json()
+    customer_id = customer["id"]
+    client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "gaming laptop within 6 to 7 lakh"})
+    response = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "add it to cart and ask salesperson to confirm availability"}).json()
+    assert response["handoff_required"] is True
+    assert "Added" in response["reply"] and "salesperson" in response["reply"]
+    cart = client.get(f"/api/v1/carts/{customer_id}").json()
+    assert len(cart["items"]) == 1
+
+
+def test_customer_can_explicitly_start_a_second_order_for_the_same_product(client):
+    customer = client.post("/api/v1/customers", json={"name": "Repeat buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a gaming laptop"})
+    first_prompt = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place my order"}).json()
+    assert first_prompt["next_action"]["action"] == "select_product"
+    first = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "1"}).json()
+    assert first["next_action"]["action"] == "order_created"
+    second_prompt = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place another order"}).json()
+    assert second_prompt["next_action"]["action"] == "select_product"
+    second = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "1"}).json()
+    assert second["next_action"]["action"] == "order_created"
+    assert second["next_action"]["order_id"] != first["next_action"]["order_id"]
+
+
+def test_better_option_respects_budget_and_can_expand_results_on_request(client):
+    customer = client.post("/api/v1/customers", json={"name": "Alternative buyer", "channel": "web"}).json()
+    customer_id = customer["id"]
+    first = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "gaming laptop within 6 to 7 lakh"}).json()
+    assert len(first["next_action"]["products"]) == 1
+    better = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "any better option?"}).json()
+    assert better["next_action"]["action"] == "related_recommendations"
+    assert "only match" in better["reply"]
+    assert "929,999" in better["reply"]
+    expanded = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "show higher options"}).json()
+    assert expanded["next_action"]["action"] == "recommend"
+    assert len(expanded["next_action"]["products"]) > 1
+
+
+def test_admin_can_manage_products_and_explicit_relationship_recommendations(client):
+    mouse = client.post("/api/v1/admin/products", json={
+        "name": "Premium gaming mouse", "category": "Accessories", "subcategory": "Mouse", "price": 60000,
+        "price_tier": "premium", "tags": ["gaming", "accessory"], "use_cases": ["gaming"],
+        "attributes": {"complements_categories": ["Gaming Laptops"]}, "features": ["high polling rate"],
+    })
+    assert mouse.status_code == 201
+    link = client.post("/api/v1/admin/product-relationships", json={
+        "main_product_id": "lenovo-rtx5090-32gb", "related_product_id": mouse.json()["id"],
+        "relationship_type": "accessory", "weight": 0.9, "note": "Premium gaming setup companion",
+    })
+    assert link.status_code == 201
+    result = client.get("/api/v1/products/lenovo-rtx5090-32gb/related").json()
+    assert result["recommendations"][0]["related_product"]["price"] == 60000
+    assert result["recommendations"][0]["relationship_type"] == "accessory"
+    removed = client.delete(f"/api/v1/admin/products/{mouse.json()['id']}")
+    assert removed.status_code == 200
+    assert mouse.json()["id"] not in {item["id"] for item in client.get("/api/v1/products").json()}
+
+
+def test_admin_and_sales_workspaces_use_distinct_login_roles(client, monkeypatch):
+    from app.main import settings
+    monkeypatch.setattr(settings, "admin_login_password", "admin-secret")
+    monkeypatch.setattr(settings, "salesperson_login_password", "sales-secret")
+    assert client.get("/api/v1/admin/identity").status_code == 401
+    assert client.get("/api/v1/admin/identity", auth=("admin", "wrong")).status_code == 401
+    assert client.get("/api/v1/admin/identity", auth=("admin", "admin-secret")).json()["id"] == "admin-001"
+    assert client.get("/api/v1/sales/identity", auth=("sales", "sales-secret")).json()["id"] == "sales-001"
+    assert client.get("/api/v1/admin/identity", auth=("sales", "sales-secret")).status_code == 401
 
 
 def test_existing_database_migrates_messages_for_salesperson_replies(client):

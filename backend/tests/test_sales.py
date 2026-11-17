@@ -118,6 +118,37 @@ def test_result_count_and_gpu_digits_do_not_become_budget_values():
     assert "budget_max_pkr" not in context
 
 
+def test_new_product_search_clears_stale_appointment_and_recommendations():
+    context = {"product_category": "laptops", "pending_appointment": True,
+               "awaiting_field": "appointment_time", "last_recommended_product_ids": ["old-product"]}
+    extract_context("I need an office laptop", context)
+    assert context["product_category"] == "laptops"
+    assert context["use_case"] == "office and everyday tasks"
+    assert "pending_appointment" not in context
+    assert "awaiting_field" not in context
+    assert "last_recommended_product_ids" not in context
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("track my order", "track_order"),
+        ("add it to cart", "add_to_cart"),
+        ("any better option?", "related_recommendations"),
+        ("place another order", "place_order"),
+        ("do you give warranty?", "human_handoff"),
+    ],
+)
+def test_new_customer_requests_have_specific_actions(message, expected):
+    context = {"product_category": "laptops", "use_case": "gaming and 3D/AI workloads"}
+    assert choose_next_action(context, "engaged", message)["action"] == expected
+
+
+def test_frustration_takes_priority_over_an_unanswered_appointment_question():
+    context = {"product_category": "laptops", "pending_appointment": True, "awaiting_field": "appointment_time"}
+    assert choose_next_action(context, "engaged", "what's wrong with you? what's wrong with you?")["action"] == "apology"
+
+
 def test_category_switch_resets_old_budget_but_keeps_followup_questions_scoped():
     context = {"product_category": "cars", "budget_max_pkr": 3_000_000}
     extract_context("Do you have laptops?", context)

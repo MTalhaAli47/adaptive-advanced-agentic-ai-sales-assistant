@@ -13,10 +13,11 @@
     .admin-table input{margin-top:6px}.order-id{font-family:ui-monospace,monospace;font-size:12px;color:#657087}
     .notice{padding:12px 15px;border-radius:10px;background:#fff8e7;color:#765415;margin:14px 0}
     .status-pill{display:inline-block;border-radius:99px;background:#eef2fa;padding:4px 9px;font-size:12px}
+    .admin-filters{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}.admin-filters select,.product-form input,.product-form textarea,.product-form select{padding:10px;border:1px solid #d8deea;border-radius:8px;font:inherit}.product-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}.product-form textarea{grid-column:1/-1;min-height:72px}.product-form .wide{grid-column:1/-1}.product-admin-row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 0;border-top:1px solid #e7eaf1}.relationship-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}.product-form button,.relationship-form button{align-self:center}@media(max-width:600px){.product-form{grid-template-columns:1fr}.product-form textarea,.product-form .wide{grid-column:auto}}
   </style>
 </head>
 <body>
-  <header class="top"><a class="brand" href="/">MetaCrux AI</a><nav class="nav"><a href="/sales">Sales workspace</a><a href="/chat">Customer chat</a></nav></header>
+  <header class="top"><a class="brand" href="/">MetaCrux AI</a><nav class="nav"><span id="staff-identity" class="tag">Admin workspace</span><a href="/sales">Sales workspace</a><a href="/chat">Customer chat</a></nav></header>
   <main class="section">
     <h1>Orders &amp; payments</h1>
     <p class="muted">Review requests, confirm orders, and record payment status.</p>
@@ -25,27 +26,49 @@
     <section class="panel" style="margin-top:18px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap"><h2>Order records</h2><button class="button" id="refresh">Refresh</button></div>
       <div id="message" class="muted" role="status"></div>
+      <div class="admin-filters"><select data-order-filter="status" aria-label="Filter order status"><option value="">All order statuses</option><option value="pending_confirmation">Not confirmed</option><option value="confirmed">Confirmed</option><option value="cancelled">Cancelled</option></select><select data-order-filter="fulfillment_status" aria-label="Filter fulfillment"><option value="">All fulfillment statuses</option><option value="not_started">Not started</option><option value="processing">Processing</option><option value="shipped">Shipped</option><option value="delivered">Delivered</option><option value="returned">Returned</option></select><select data-order-filter="payment_status" aria-label="Filter payment"><option value="">All payment statuses</option><option value="not_paid">Not paid</option><option value="paid">Paid</option><option value="refunded">Refunded</option></select></div>
       <div class="admin-table-wrap"><table class="admin-table"><thead><tr><th>Order / customer</th><th>Product</th><th>Amount</th><th>Order status</th><th>Payment</th><th>Fulfillment</th><th>Staff notes</th><th>Save</th></tr></thead><tbody id="orders"><tr><td colspan="8">Loading orders…</td></tr></tbody></table></div>
     </section>
     <section class="panel" style="margin-top:18px">
-      <h2>Appointment requests</h2>
+      <h2>Appointment requests &amp; booked appointments</h2><p class="muted">New bookings appear here with the requested time. Confirm or update them below.</p>
       <div class="admin-table-wrap"><table class="admin-table" style="min-width:700px"><thead><tr><th>Customer</th><th>Requested time</th><th>Status</th><th>Notes</th><th>Save</th></tr></thead><tbody id="appointments"><tr><td colspan="5">Loading appointments…</td></tr></tbody></table></div>
+    </section>
+    <section class="panel" style="margin-top:18px"><h2>Product catalogue</h2><p class="muted">Add catalogue items or remove them from sale. Removed items stay attached to historical orders.</p>
+      <form id="product-form" class="product-form">
+        <input name="name" placeholder="Product name" required maxlength="200"><input name="category" placeholder="Category" required maxlength="100">
+        <input name="subcategory" placeholder="Subcategory"><input name="price" type="number" min="0" step="0.01" placeholder="Price (leave blank if quote only)">
+        <input name="currency" value="PKR" maxlength="3" aria-label="Currency"><select name="price_tier"><option value="">Price tier (optional)</option><option value="budget">Budget</option><option value="mid_range">Mid-range</option><option value="premium">Premium</option></select>
+        <input name="tags" placeholder="Tags, comma separated"><input name="use_cases" placeholder="Use cases, comma separated">
+        <input name="performance_level" placeholder="Performance level"><input name="suitable_profiles" placeholder="Suitable customer profiles, comma separated">
+        <textarea name="description" class="wide" placeholder="Description" maxlength="4000"></textarea>
+        <input name="features" placeholder="Features, comma separated"><input name="attributes" placeholder='Attributes JSON, e.g. {"connector":"USB-C"}'>
+        <input name="compatibility" class="wide" placeholder='Compatibility JSON, e.g. {"compatible_with_product_ids":["product-id"]}'>
+        <button class="button wide" type="submit">Add product</button>
+      </form><div id="product-admin-list"></div>
+      <h3>Explicit product relationship</h3><p class="muted">Link a main item to a compatible accessory, upgrade, alternative, or other companion.</p>
+      <form id="relationship-form" class="relationship-form"><select name="main_product_id" required aria-label="Main product"></select><select name="related_product_id" required aria-label="Related product"></select><select name="relationship_type" required><option value="accessory">Accessory</option><option value="complementary">Complementary</option><option value="frequently_bought_together">Frequently bought together</option><option value="upgrade">Upgrade</option><option value="alternative">Alternative</option><option value="essential_companion">Essential companion</option><option value="consumable">Consumable</option><option value="use_case">Use case</option></select><input name="weight" type="number" min="0" max="1" step="0.05" value="1" aria-label="Relationship strength"><input name="note" placeholder="Why it is related"><button class="button" type="submit">Save relationship</button></form><div id="relationship-list"></div>
     </section>
   </main>
 <script>
+const rawFetch=globalThis.fetch.bind(globalThis);let adminLoginPrompt;
+async function adminFetch(url,options={}){const protectedCall=String(url).includes('/api/v1/admin/');let requestOptions=options;const cached=sessionStorage.getItem('aisa_admin_auth');if(protectedCall&&cached){const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${cached}`);requestOptions={...options,headers}}let response=await rawFetch(url,requestOptions);if(response.status!==401||!protectedCall)return response;if(!adminLoginPrompt)adminLoginPrompt=(async()=>{const login=sessionStorage.getItem('aisa_admin_login')||prompt('Admin login ID');const password=prompt('Admin password');if(!login||!password)return null;const value=btoa(`${login}:${password}`);sessionStorage.setItem('aisa_admin_login',login);sessionStorage.setItem('aisa_admin_auth',value);return value})();const auth=await adminLoginPrompt;if(!auth)return response;const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${auth}`);response=await rawFetch(url,{...options,headers});if(response.status===401){sessionStorage.removeItem('aisa_admin_auth');adminLoginPrompt=null}return response}
+globalThis.fetch=adminFetch;
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-let orderRows=[];
+let orderRows=[],catalogueRows=[],relationshipRows=[];
 const orderLabel=status=>status==='pending_approval'||status==='pending_confirmation'?'Not confirmed':status==='confirmed'?'Confirmed':'Cancelled';
 const paymentLabel=status=>status==='not_paid'?'Not paid':status==='paid'?'Paid':'Refunded';
 async function load(){
   document.querySelector('#message').textContent='Loading order records…';
-  const [summaryResponse,ordersResponse,appointmentsResponse]=await Promise.all([fetch('/api/v1/admin/summary'),fetch('/api/v1/admin/orders'),fetch('/api/v1/admin/appointments')]);
-  if(!summaryResponse.ok||!ordersResponse.ok||!appointmentsResponse.ok)throw new Error('Could not load the admin records.');
-  const summary=await summaryResponse.json();orderRows=await ordersResponse.json();const appointments=await appointmentsResponse.json();
+  const [identityResponse,summaryResponse,ordersResponse,appointmentsResponse,productsResponse,relationshipsResponse]=await Promise.all([fetch('/api/v1/admin/identity'),fetch('/api/v1/admin/summary'),fetch('/api/v1/admin/orders'),fetch('/api/v1/admin/appointments'),fetch('/api/v1/admin/products'),fetch('/api/v1/admin/product-relationships')]);
+  if(!identityResponse.ok||!summaryResponse.ok||!ordersResponse.ok||!appointmentsResponse.ok||!productsResponse.ok||!relationshipsResponse.ok)throw new Error('Could not load admin records. Check the admin login ID and password in the project settings.');
+  const identity=await identityResponse.json();document.querySelector('#staff-identity').textContent=`Admin ID: ${identity.id} · Login: ${identity.login_id}`;
+  const summary=await summaryResponse.json();orderRows=await ordersResponse.json();const appointments=await appointmentsResponse.json();catalogueRows=await productsResponse.json();relationshipRows=await relationshipsResponse.json();
   document.querySelector('#summary').innerHTML=[['Total orders',summary.total],['Not confirmed',summary.awaiting_confirmation],['Confirmed',summary.confirmed],['Not paid',summary.not_paid],['Marked paid',summary.paid],['Delivered',summary.delivered],['Appointments to confirm',summary.appointments_requested],['Appointments confirmed',summary.appointments_confirmed]].map(([label,value])=>`<article class="card"><span class="muted">${label}</span><div class="stat">${value}</div></article>`).join('');
   document.querySelector('#message').textContent=orderRows.length?`${orderRows.length} order record${orderRows.length===1?'':'s'}.`:'No orders have been placed yet.';
-  document.querySelector('#orders').innerHTML=orderRows.length?orderRows.map(order=>`<tr data-order-id="${esc(order.id)}">
-    <td><strong>${esc(order.customer_name)}</strong><br><span class="muted">${esc(order.customer_contact||'No contact provided')}</span><br><span class="order-id">Order ${esc(order.id)}</span>${order.checkout_id?`<br><span class="order-id">Checkout ${esc(order.checkout_id)}</span>`:''}<br><small class="muted">${esc(new Date(order.created_at).toLocaleString())}</small></td>
+  const filters=Object.fromEntries([...document.querySelectorAll('[data-order-filter]')].map(select=>[select.dataset.orderFilter,select.value]));
+  const visibleOrders=orderRows.filter(order=>Object.entries(filters).every(([field,value])=>!value||(field==='status'&&value==='pending_confirmation'?['pending_confirmation','pending_approval'].includes(order.status):order[field]===value)));
+  document.querySelector('#orders').innerHTML=visibleOrders.length?visibleOrders.map(order=>`<tr data-order-id="${esc(order.id)}">
+    <td><strong>${esc(order.customer_name)}</strong><br><span class="muted">${esc(order.customer_contact||'No contact provided')}</span><br><span class="order-id">User ${esc(order.customer_id)}</span><br><span class="order-id">Order ${esc(order.id)}</span>${order.checkout_id?`<br><span class="order-id">Checkout ${esc(order.checkout_id)}</span>`:''}<br><small class="muted">${esc(new Date(order.created_at).toLocaleString())}</small></td>
     <td>${esc(order.product_name)}<br><span class="muted">Quantity: ${order.quantity}</span></td>
     <td>${order.unit_price==null?'Price on request':`${esc(order.currency)} ${Number(order.unit_price*order.quantity).toLocaleString()}`}</td>
     <td><label class="status-pill">${orderLabel(order.status)}</label><select data-field="status" aria-label="Order status"><option value="pending_confirmation" ${order.status==='pending_confirmation'||order.status==='pending_approval'?'selected':''}>Not confirmed</option><option value="confirmed" ${order.status==='confirmed'?'selected':''}>Confirmed</option><option value="cancelled" ${order.status==='cancelled'?'selected':''}>Cancelled</option></select></td>
@@ -55,9 +78,18 @@ async function load(){
     <td><button class="button save-order" type="button">Save</button></td>
   </tr>`).join(''):'<tr><td colspan="8" class="muted">No orders have been placed yet.</td></tr>';
   document.querySelectorAll('.save-order').forEach(button=>button.addEventListener('click',saveOrder));
-  document.querySelector('#appointments').innerHTML=appointments.length?appointments.map(item=>`<tr data-appointment-id="${esc(item.id)}"><td><strong>${esc(item.customer_name)}</strong><br><span class="muted">${esc(item.customer_contact||'No contact provided')}</span></td><td>${esc(item.requested_time)}</td><td><select data-field="status" aria-label="Appointment status"><option value="requested" ${item.status==='requested'?'selected':''}>Requested</option><option value="confirmed" ${item.status==='confirmed'?'selected':''}>Confirmed</option><option value="cancelled" ${item.status==='cancelled'?'selected':''}>Cancelled</option><option value="completed" ${item.status==='completed'?'selected':''}>Completed</option></select></td><td><input data-field="notes" value="${esc(item.notes||'')}" placeholder="Staff note"></td><td><button class="button save-appointment" type="button">Save</button></td></tr>`).join(''):'<tr><td colspan="5" class="muted">No appointment requests yet.</td></tr>';
+  document.querySelector('#appointments').innerHTML=appointments.length?appointments.map(item=>`<tr data-appointment-id="${esc(item.id)}"><td><strong>${esc(item.customer_name)}</strong><br><span class="muted">${esc(item.customer_contact||'No contact provided')}</span></td><td>${esc(item.requested_time)}</td><td><select data-field="status" aria-label="Appointment status"><option value="requested" ${item.status==='requested'?'selected':''}>Requested</option><option value="confirmed" ${item.status==='confirmed'?'selected':''}>Confirmed</option><option value="cancelled" ${item.status==='cancelled'?'selected':''}>Cancelled</option><option value="completed" ${item.status==='completed'?'selected':''}>Completed</option></select></td><td><input data-field="notes" value="${esc(item.notes||'')}" placeholder="Staff note"></td><td><button class="button save-appointment" type="button">Save</button></td></tr>`).join(''):'<tr><td colspan="5" class="muted">No booked appointments or requests yet.</td></tr>';
   document.querySelectorAll('.save-appointment').forEach(button=>button.addEventListener('click',saveAppointment));
+  renderProducts();renderRelationships();
 }
+function renderProducts(){
+  const root=document.querySelector('#product-admin-list');
+  root.innerHTML=catalogueRows.length?catalogueRows.map(product=>`<div class="product-admin-row"><div><strong>${esc(product.name)}</strong> <span class="tag">${esc(product.category)}</span> ${product.active?'<span class="tag">Active</span>':'<span class="tag">Removed</span>'}<br><small class="muted">${product.price==null?'Price on request':`${esc(product.currency)} ${Number(product.price).toLocaleString()}`} · ${esc(product.price_tier||'tier not set')}</small></div>${product.active?`<button class="button remove-product" data-id="${esc(product.id)}" type="button" style="background:#a83232">Remove product</button>`:''}</div>`).join(''):'<p class="muted">No products in the catalogue yet.</p>';
+  for(const button of root.querySelectorAll('.remove-product'))button.addEventListener('click',async()=>{if(!confirm('Remove this product from the active catalogue? Existing orders will be preserved.'))return;const response=await fetch(`/api/v1/admin/products/${encodeURIComponent(button.dataset.id)}`,{method:'DELETE'});if(!response.ok){document.querySelector('#message').textContent='Could not remove this product.';return}await load()});
+  const options=catalogueRows.filter(p=>p.active).map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+  for(const select of document.querySelectorAll('#relationship-form select[name$="product_id"]')){const previous=select.value;select.innerHTML=options;if([...select.options].some(option=>option.value===previous))select.value=previous}
+}
+function renderRelationships(){const root=document.querySelector('#relationship-list');root.innerHTML=relationshipRows.length?relationshipRows.map(link=>`<div class="product-admin-row"><span>${esc(link.main_product_name)} <strong>→ ${esc(link.relationship_type.replaceAll('_',' '))} →</strong> ${esc(link.related_product_name)} <small class="muted">(${Math.round(link.weight*100)}%)</small></span><button type="button" class="button remove-relationship" data-id="${esc(link.id)}" style="background:#596579">Remove link</button></div>`).join(''):'<p class="muted">No explicit product links yet. Attribute matching can still suggest related items.</p>';for(const button of root.querySelectorAll('.remove-relationship'))button.addEventListener('click',async()=>{await fetch(`/api/v1/admin/product-relationships/${encodeURIComponent(button.dataset.id)}`,{method:'DELETE'});await load()})}
 async function saveAppointment(event){
   const button=event.currentTarget,row=button.closest('tr'),id=row.dataset.appointmentId;button.disabled=true;
   const payload={};row.querySelectorAll('[data-field]').forEach(input=>payload[input.dataset.field]=input.value.trim());
@@ -73,6 +105,18 @@ async function saveOrder(event){
   finally{button.disabled=false}
 }
 document.querySelector('#refresh').addEventListener('click',()=>load().catch(error=>document.querySelector('#message').textContent=error.message));
+document.querySelectorAll('[data-order-filter]').forEach(select=>select.addEventListener('change',()=>load().catch(error=>document.querySelector('#message').textContent=error.message)));
+document.querySelector('#product-form').addEventListener('submit',async event=>{
+  event.preventDefault();const form=event.currentTarget,values=Object.fromEntries(new FormData(form).entries());
+  const split=value=>value.split(',').map(item=>item.trim()).filter(Boolean);
+  let attributes={},compatibility={};try{attributes=values.attributes?JSON.parse(values.attributes):{};compatibility=values.compatibility?JSON.parse(values.compatibility):{}}catch{document.querySelector('#message').textContent='Attributes and compatibility must be valid JSON.';return}
+  const payload={name:values.name,category:values.category,subcategory:values.subcategory||null,description:values.description||'',price:values.price===''?null:Number(values.price),currency:values.currency||'PKR',price_tier:values.price_tier||null,tags:split(values.tags||''),use_cases:split(values.use_cases||''),performance_level:values.performance_level||null,suitable_profiles:split(values.suitable_profiles||''),features:split(values.features||''),attributes,compatibility};
+  const button=form.querySelector('button');button.disabled=true;try{const response=await fetch('/api/v1/admin/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Could not add product.');form.reset();document.querySelector('#message').textContent=`Added ${result.name} to the catalogue.`;await load()}catch(error){document.querySelector('#message').textContent=error.message}finally{button.disabled=false}
+});
+document.querySelector('#relationship-form').addEventListener('submit',async event=>{
+  event.preventDefault();const values=Object.fromEntries(new FormData(event.currentTarget).entries());const button=event.currentTarget.querySelector('button');button.disabled=true;
+  try{const response=await fetch('/api/v1/admin/product-relationships',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values,weight:Number(values.weight)})});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Could not save relationship.');document.querySelector('#message').textContent='Product relationship saved.';await load()}catch(error){document.querySelector('#message').textContent=error.message}finally{button.disabled=false}
+});
 load().catch(error=>document.querySelector('#message').textContent=error.message);
 </script>
 </body>

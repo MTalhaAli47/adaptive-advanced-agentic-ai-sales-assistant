@@ -7,8 +7,11 @@ AMOUNT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(million
 HANDOFF_RE = re.compile(r"\b(?:human|person|agent|sales\s*person|salesperson|sales\s*rep|representative)\b|\bcall me\b", re.IGNORECASE)
 CONFIRM_RE = re.compile(r"\b(?:confirm|verify)\b.*\b(?:it|this|that|stock|availability|order|payment)\b|\b(?:is it|are they)\s+(?:available|in stock)\b", re.IGNORECASE)
 PAYMENT_RE = re.compile(r"\b(?:payment|pay|paying|checkout|bank transfer|transfer money)\b", re.IGNORECASE)
-ORDER_RE = re.compile(r"\b(?:place|put in|make)\s+(?:(?:my|an?|the)\s+)?orders?\b|\b(?:order|buy|purchase)\s+(?:it|this|that|the\s+[\w-]+)\b|\bi(?:'ll| will) take (?:it|this|that)\b", re.IGNORECASE)
-FRUSTRATION_RE = re.compile(r"\b(?:are you mad|mad|silly|stupid|useless|you lost|lost context|not listening|frustrated|annoyed)\b|\b(?:uff+|ugh+)\b", re.IGNORECASE)
+ORDER_RE = re.compile(r"\b(?:place|put in|make)\s+(?:(?:my|an?|the|another|one more|a new)\s+)?orders?\b|\b(?:order|buy|purchase)\s+(?:it|this|that|the\s+[\w-]+)\b|\bi(?:'ll| will) take (?:it|this|that)\b", re.IGNORECASE)
+FRUSTRATION_RE = re.compile(r"\b(?:are you mad|mad|silly|stupid|useless|you lost|lost context|not listening|frustrated|annoyed|shut up|static|be real|what'?s wrong|what is wrong)\b|\b(?:uff+|ugh+)\b", re.IGNORECASE)
+TRACK_ORDER_RE = re.compile(r"\b(?:track|status|where is|where's|check on)\b.{0,30}\border\b|\border\b.{0,20}\b(?:status|tracking)\b", re.IGNORECASE)
+RELATED_RE = re.compile(r"\b(?:related|similar|alternative|alternatives|better option|other option|other options|upgrade)\b", re.IGNORECASE)
+CART_RE = re.compile(r"\b(?:add|put|place)\b.{0,40}\b(?:cart|basket)\b|\b(?:cart|basket)\b.{0,30}\b(?:add|put)\b", re.IGNORECASE)
 THANKS_RE = re.compile(r"\b(?:thanks|thank you|thank u|thx)\b", re.IGNORECASE)
 APPOINTMENT_RE = re.compile(r"\b(?:appointment|meeting|demo)\b|\bbook\s+(?:a\s+)?call\b|\b(?:book|schedule|arrange)\b.{0,30}\b(?:call|session)\b", re.IGNORECASE)
 
@@ -66,7 +69,7 @@ def _category(text: str) -> str | None:
     if request:
         interest = request.group(1).strip(" .?!,")
         interest = re.sub(r"\b(please|for me|today|now)\b", "", interest).strip()
-        if re.search(r"\b(payment|pay|order|purchase|human|person|agent|representative|confirm|verify|availability)\b", interest):
+        if re.search(r"\b(payment|pay|order|purchase|human|person|agent|representative|confirm|verify|availability|warranty|guarantee|refund|return policy|delivery|shipping|appointment|meeting|tracking|status)\b", interest):
             return None
         if interest and interest not in {"something", "anything", "one", "some"}:
             return interest
@@ -97,12 +100,21 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("minimum_vram_gb", None)
         context.pop("result_limit", None)
         context.pop("price_order", None)
+        context.pop("last_recommended_product_ids", None)
+        context.pop("pending_budget_alternative", None)
+        if starts_new_search:
+            context.pop("pending_appointment", None)
+            context.pop("appointment_requested_time", None)
+            if context.get("awaiting_field") == "appointment_time":
+                context.pop("awaiting_field", None)
 
     appointment_requested = _requests_appointment(lowered)
     if appointment_requested:
         time_match = re.search(r"\b(?:on|at|for)\s+(.+)$", text, re.IGNORECASE)
-        if time_match and len(time_match.group(1).strip()) >= 3:
-            context["appointment_requested_time"] = time_match.group(1).strip()[:120]
+        day_time_match = re.search(r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next\s+week|this\s+week|next\s+month|this\s+month)\b.*$", text, re.IGNORECASE)
+        requested_time = day_time_match.group(0).strip() if day_time_match else (time_match.group(1).strip() if time_match else "")
+        if requested_time and len(requested_time) >= 3:
+            context["appointment_requested_time"] = requested_time[:120]
             context["pending_appointment"] = True
             context.pop("awaiting_field", None)
         else:
@@ -179,6 +191,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("budget_needs_clarification", None)
         context.pop("budget_clarification_count", None)
         context.pop("budget_no_match", None)
+        context.pop("pending_budget_alternative", None)
         context.pop("awaiting_field", None)
     elif budget_requested and re.search(r"\b(no|any|flexible|no limit)\b", lowered):
         context["budget_flexible"] = True
@@ -211,6 +224,15 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
             context["budget_needs_clarification"] = True
             context["budget_clarification_count"] = clarification_count
 
+    if context.get("pending_budget_alternative") and re.fullmatch(r"\s*(yes|yeah|yep|sure|show|show me|show options|show higher options|show upgrades|show them|okay|ok)\s*[.!]?\s*", lowered):
+        context.pop("pending_budget_alternative", None)
+        context.pop("budget_min_pkr", None)
+        context.pop("budget_max_pkr", None)
+        context["budget_flexible"] = True
+        context.pop("last_recommended_product_ids", None)
+    elif context.get("pending_budget_alternative") and re.fullmatch(r"\s*(no|no thanks|not now)\s*[.!]?\s*", lowered):
+        context.pop("pending_budget_alternative", None)
+
     if "urgent" in lowered or "asap" in lowered or "today" in lowered:
         context["urgency"] = "high"
     if any(term in lowered for term in ("tomorrow", "this week", "next week", "this month", "next month", "soon", "within")):
@@ -231,7 +253,9 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     elif detected_category:
         context["intent"] = "product_inquiry"
 
-    if len(text) > 2 and lowered not in {"yes", "no", "ok", "okay", "hi", "hello"}:
+    if len(text) > 2 and lowered not in {"yes", "no", "ok", "okay", "hi", "hello"} and (
+        not context.get("need") or (detected_category and (starts_new_search or detected_category != prior_category))
+    ):
         context["need"] = text[:240]
     context["last_customer_message"] = text[:500]
     return context
@@ -245,8 +269,26 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
         return {"action": "human_handoff", "reason": "Customer asked a salesperson to confirm availability or order details.", "requires_approval": False}
     if _requests_payment(lowered):
         return {"action": "payment_help", "reason": "Customer needs help arranging payment; no payment is taken in chat."}
+    if TRACK_ORDER_RE.search(lowered):
+        return {"action": "track_order", "reason": "Customer asked for the status of their own order."}
+    if CART_RE.search(lowered):
+        return {"action": "add_to_cart", "reason": "Customer wants to add a recommended product to their cart."}
+    if RELATED_RE.search(lowered):
+        return {"action": "related_recommendations", "reason": "Customer asked for related products or alternatives."}
     if _requests_order(lowered):
         return {"action": "place_order", "reason": "Customer explicitly asked to place an order."}
+    if context.get("awaiting_field") == "cart_product_selection":
+        return {"action": "add_to_cart", "reason": "Customer is selecting a product to add to the cart."}
+    if re.search(r"\b(?:warranty|guarantee|return policy|refund policy)\b", lowered):
+        return {"action": "human_handoff", "reason": "Warranty or return terms are not listed in the product catalogue; a salesperson must confirm."}
+    if FRUSTRATION_RE.search(lowered):
+        category = context.get("product_category")
+        focus = f"I’m helping you with {category}. " if category else ""
+        return {
+            "action": "apology",
+            "reason": "Customer is frustrated; acknowledge it and offer a clear next step.",
+            "reply": f"I’m sorry—I lost track of what you asked. {focus}Would you like me to show options, ask a salesperson to confirm availability, or help place an order?",
+        }
     if _requests_appointment(lowered) or context.get("pending_appointment"):
         if context.get("appointment_requested_time"):
             return {"action": "create_appointment", "reason": "Customer asked to schedule a meeting and provided a requested time."}
@@ -255,14 +297,6 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
             "action": "clarify_appointment",
             "reason": "The appointment request needs a date or time before it can be recorded.",
             "question": "I can pass that along. What day and time should I request?",
-        }
-    if FRUSTRATION_RE.search(lowered):
-        category = context.get("product_category")
-        focus = f"I’m helping you with {category}. " if category else ""
-        return {
-            "action": "apology",
-            "reason": "Customer is frustrated; acknowledge it and offer a clear next step.",
-            "reply": f"I’m sorry—I lost track of what you asked. {focus}Would you like me to show options, ask a salesperson to confirm availability, or help place an order?",
         }
     if THANKS_RE.search(lowered):
         return {"action": "smalltalk", "reason": "Acknowledge the customer and keep their order context."}

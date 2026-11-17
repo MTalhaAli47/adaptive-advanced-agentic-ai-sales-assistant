@@ -36,6 +36,9 @@ class LocalFallbackProvider:
             return next_action.get("question", "Which of the listed products would you like?")
         if action == "awaiting_salesperson":
             return "Your message is in the conversation. A salesperson will reply here."
+        if action == "cart_item_added":
+            product = action.get("product", {})
+            return f"Added {product.get('name', 'the selected product')} to your cart. You can review it on the Cart page."
         if action == "discover":
             return next_action.get("question", "Hi! I can help with laptops, solar, and software. What are you looking for?")
         if action == "greet":
@@ -79,6 +82,13 @@ class LocalFallbackProvider:
                         message += "\n\nThis is the only current match. Would you like me to record an order request or ask a salesperson to confirm availability?"
                     else:
                         message += "\n\nWhich option looks closest to what you need? I can help place an order request or ask sales to confirm availability."
+                related = next_action.get("related_products", [])
+                if related:
+                    message += "\n\nYou may also find these useful:"
+                    for item in related[:3]:
+                        product = item["related_product"]
+                        price = f"{product.get('currency', 'PKR')} {int(product['price']):,}" if product.get("price") is not None else "price on request"
+                        message += f"\n• {product['name']} — {price}. {item['reason']}"
                 return message
             return "Thanks, I have the key details. I’ll use them to find a suitable option; a salesperson can confirm availability and final terms."
         if action == "answer":

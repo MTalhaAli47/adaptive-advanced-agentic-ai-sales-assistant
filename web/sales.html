@@ -16,7 +16,7 @@
   </style>
 </head>
 <body>
-  <header class="top"><a class="brand" href="/">MetaCrux AI</a><nav class="nav"><a href="/">Website</a><a href="/chat">Customer chat</a><a href="/admin">Orders admin</a></nav></header>
+  <header class="top"><a class="brand" href="/">MetaCrux AI</a><nav class="nav"><span id="staff-identity" class="tag">Sales workspace</span><a href="/">Website</a><a href="/chat">Customer chat</a><a href="/admin">Orders admin</a></nav></header>
   <main class="section">
     <h1>Sales workspace</h1><p class="muted">Review customer conversations and reply when someone asks for a person.</p>
     <div id="stats" class="statrow"></div>
@@ -30,6 +30,9 @@
     <section class="panel" style="margin-top:18px"><h2>Shared product catalogue</h2><div id="products"></div></section>
   </main>
 <script>
+const rawFetch=globalThis.fetch.bind(globalThis);let salesLoginPrompt;
+async function salesFetch(url,options={}){const protectedCall=String(url).includes('/api/v1/sales/')||String(url).includes('/api/v1/dashboard/summary');let requestOptions=options;const cached=sessionStorage.getItem('aisa_sales_auth');if(protectedCall&&cached){const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${cached}`);requestOptions={...options,headers}}let response=await rawFetch(url,requestOptions);if(response.status!==401||!protectedCall)return response;if(!salesLoginPrompt)salesLoginPrompt=(async()=>{const login=sessionStorage.getItem('aisa_sales_login')||prompt('Salesperson login ID');const password=prompt('Salesperson password');if(!login||!password)return null;const value=btoa(`${login}:${password}`);sessionStorage.setItem('aisa_sales_login',login);sessionStorage.setItem('aisa_sales_auth',value);return value})();const auth=await salesLoginPrompt;if(!auth)return response;const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${auth}`);response=await rawFetch(url,{...options,headers});if(response.status===401){sessionStorage.removeItem('aisa_sales_auth');salesLoginPrompt=null}return response}
+globalThis.fetch=salesFetch;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let data=[],selectedId=null;
 async function load(){
@@ -38,6 +41,7 @@ async function load(){
     fetch('/api/v1/products').then(r=>r.json()),fetch('/api/v1/sales/handoffs').then(r=>r.json())
   ]);
   data=w.conversations;
+  if(w.staff)document.querySelector('#staff-identity').textContent=`Salesperson ID: ${w.staff.id} · Login: ${w.staff.login_id}`;
   document.querySelector('#stats').innerHTML=[['Leads',s.leads],['Human handoffs',s.handoffs],['Appointments to confirm',s.appointments_to_confirm],['Orders awaiting approval',s.orders_pending_approval]].map(x=>`<article class="card"><span class="muted">${x[0]}</span><div class="stat">${x[1]}</div></article>`).join('');
   document.querySelector('#handoffs').innerHTML=h.handoffs.map(x=>{const c=x.customer;return `<button class="lead handoff-lead" onclick="showLead('${esc(c.id)}')"><strong>${esc(c.name)}</strong><br><span class="tag">Waiting for you</span><br><small class="muted">${esc(x.last_message||'Customer requested a salesperson')}</small></button>`}).join('');
   document.querySelector('#leads').innerHTML=data.length?data.map(x=>`<button class="lead" onclick="showLead('${esc(x.customer.id)}')"><strong>${esc(x.customer.name)}</strong><br><span class="tag">${esc(x.customer.channel)}</span> <span class="tag">${esc(x.customer.sales_stage)}</span><br><small class="muted">${esc(x.last_message?.content||'No messages yet')}</small></button>`).join(''):'<p class="muted">No conversations yet. Start a customer conversation to see it here.</p>';
@@ -47,7 +51,7 @@ async function load(){
 async function showLead(id){
   selectedId=id;const item=data.find(x=>x.customer.id===id);if(!item)return;
   const c=item.customer,detail=document.querySelector('#detail');
-  detail.innerHTML=`<h2>${esc(c.name)}</h2><p><span class="tag">${esc(c.channel)}</span> <span class="tag">${esc(c.sales_stage.replaceAll('_',' '))}</span> ${c.handoff_requested?'<span class="tag">Waiting for salesperson</span>':''}</p>${renderCustomerContext(c.context||{})}<h3>Next best action</h3><div class="next-action"><strong>${esc(item.next_action.action.replaceAll('_',' '))}</strong><p>${esc(item.next_action.reason)}</p>${item.next_action.question?`<p><strong>Suggested question:</strong> ${esc(item.next_action.question)}</p>`:''}</div><h3>Conversation</h3><div id="history" class="conversation">Loading…</div>${c.handoff_requested?`<form id="sales-reply" class="sales-reply"><input name="message" aria-label="Reply to customer" placeholder="Write a reply to ${esc(c.name)}…" required maxlength="8000"><button class="button">Send reply</button></form><button class="button" style="margin-top:10px;background:#596579" onclick="resolveHandoff('${esc(c.id)}')">Mark handoff complete</button>`:`<button class="button" onclick="handoff('${esc(c.id)}')">Request salesperson follow-up</button>`}`;
+  detail.innerHTML=`<h2>${esc(c.name)}</h2><p><span class="tag">Customer ID: ${esc(c.user_id||c.id)}</span> <span class="tag">${esc(c.channel)}</span> <span class="tag">${esc(c.sales_stage.replaceAll('_',' '))}</span> ${c.handoff_requested?'<span class="tag">Waiting for salesperson</span>':''}</p>${renderCustomerContext(c.context||{})}<h3>Next best action</h3><div class="next-action"><strong>${esc(item.next_action.action.replaceAll('_',' '))}</strong><p>${esc(item.next_action.reason)}</p>${item.next_action.question?`<p><strong>Suggested question:</strong> ${esc(item.next_action.question)}</p>`:''}</div><h3>Conversation</h3><div id="history" class="conversation">Loading…</div>${c.handoff_requested?`<form id="sales-reply" class="sales-reply"><input name="message" aria-label="Reply to customer" placeholder="Write a reply to ${esc(c.name)}…" required maxlength="8000"><button class="button">Send reply</button></form><button class="button" style="margin-top:10px;background:#596579" onclick="resolveHandoff('${esc(c.id)}')">Mark handoff complete</button>`:`<button class="button" onclick="handoff('${esc(c.id)}')">Request salesperson follow-up</button>`}`;
   const history=await fetch(`/api/v1/conversations/${encodeURIComponent(c.id)}`).then(r=>r.json());
   if(selectedId!==id)return;
   document.querySelector('#history').innerHTML=history.messages.map(m=>`<div class="bubble ${m.role==='customer'?'customer':m.role==='salesperson'?'salesperson':'assistant'}"><strong>${m.role==='salesperson'?'Salesperson':m.role==='customer'?esc(c.name):'Assistant'}</strong><br>${esc(m.content)}</div>`).join('')||'<span class="muted">No messages.</span>';

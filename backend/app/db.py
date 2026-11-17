@@ -45,6 +45,7 @@ def initialize_database() -> None:
                 context_json TEXT NOT NULL DEFAULT '{}',
                 sales_stage TEXT NOT NULL DEFAULT 'new',
                 handoff_requested INTEGER NOT NULL DEFAULT 0,
+                access_token_hash TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
@@ -69,7 +70,17 @@ def initialize_database() -> None:
                 gpu_model TEXT,
                 vram_gb INTEGER,
                 storage_gb INTEGER,
-                condition TEXT
+                condition TEXT,
+                subcategory TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                price_tier TEXT,
+                use_cases_json TEXT NOT NULL DEFAULT '[]',
+                performance_level TEXT,
+                compatibility_json TEXT NOT NULL DEFAULT '{}',
+                features_json TEXT NOT NULL DEFAULT '[]',
+                suitable_profiles_json TEXT NOT NULL DEFAULT '[]',
+                created_by_user_id TEXT
             );
             CREATE TABLE IF NOT EXISTS appointments (
                 id TEXT PRIMARY KEY,
@@ -77,6 +88,7 @@ def initialize_database() -> None:
                 requested_time TEXT NOT NULL,
                 notes TEXT,
                 status TEXT NOT NULL DEFAULT 'requested',
+                updated_by_user_id TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS orders (
@@ -91,6 +103,7 @@ def initialize_database() -> None:
                 payment_reference TEXT,
                 admin_note TEXT,
                 confirmed_at TEXT,
+                updated_by_user_id TEXT,
                 payment_updated_at TEXT,
                 updated_at TEXT,
                 created_at TEXT NOT NULL
@@ -101,6 +114,18 @@ def initialize_database() -> None:
                 quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 100),
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(customer_id, product_id)
+            );
+            CREATE TABLE IF NOT EXISTS product_relationships (
+                id TEXT PRIMARY KEY,
+                main_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                related_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                relationship_type TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                note TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by_user_id TEXT,
+                UNIQUE(main_product_id,related_product_id,relationship_type),
+                CHECK(main_product_id <> related_product_id)
             );
             """
         )
@@ -127,17 +152,33 @@ def initialize_database() -> None:
             ("payment_status", "TEXT NOT NULL DEFAULT 'not_paid'"),
             ("fulfillment_status", "TEXT NOT NULL DEFAULT 'not_started'"),
             ("payment_method", "TEXT"), ("payment_reference", "TEXT"), ("admin_note", "TEXT"),
-            ("confirmed_at", "TEXT"), ("payment_updated_at", "TEXT"), ("updated_at", "TEXT"),
+            ("confirmed_at", "TEXT"), ("updated_by_user_id", "TEXT"), ("payment_updated_at", "TEXT"), ("updated_at", "TEXT"),
         ):
             if column not in order_columns:
                 db.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+        customer_columns = {row["name"] for row in db.execute("PRAGMA table_info(customers)").fetchall()}
+        if "access_token_hash" not in customer_columns:
+            db.execute("ALTER TABLE customers ADD COLUMN access_token_hash TEXT")
+        appointment_columns = {row["name"] for row in db.execute("PRAGMA table_info(appointments)").fetchall()}
+        if "updated_by_user_id" not in appointment_columns:
+            db.execute("ALTER TABLE appointments ADD COLUMN updated_by_user_id TEXT")
         existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
         for column, definition in (
             ("brand", "TEXT"), ("ram_gb", "INTEGER"), ("gpu_model", "TEXT"),
             ("vram_gb", "INTEGER"), ("storage_gb", "INTEGER"), ("condition", "TEXT"),
+            ("subcategory", "TEXT"), ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("attributes_json", "TEXT NOT NULL DEFAULT '{}'"), ("price_tier", "TEXT"),
+            ("use_cases_json", "TEXT NOT NULL DEFAULT '[]'"), ("performance_level", "TEXT"),
+            ("compatibility_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("features_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("suitable_profiles_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("created_by_user_id", "TEXT"),
         ):
             if column not in existing_columns:
                 db.execute(f"ALTER TABLE products ADD COLUMN {column} {definition}")
+        relationship_columns = {row["name"] for row in db.execute("PRAGMA table_info(product_relationships)").fetchall()}
+        if "created_by_user_id" not in relationship_columns:
+            db.execute("ALTER TABLE product_relationships ADD COLUMN created_by_user_id TEXT")
         db.executemany(
             "INSERT OR IGNORE INTO products(id,name,description,category,price,currency) VALUES(?,?,?,?,?,?)",
             [
@@ -165,6 +206,19 @@ def initialize_database() -> None:
                 ("HP", 8, None, None, 256, "used; verify unit condition", "hp-840g5-i5-8350u"),
                 ("HP", 8, None, None, 256, "used; verify unit condition", "hp-840g5-i5-8250u"),
                 ("HP", 16, None, None, 512, "used; verify unit condition", "hp-840g5-i7-8650u"),
+            ],
+        )
+        db.executemany(
+            "UPDATE products SET tags_json=?,use_cases_json=?,price_tier=?,performance_level=? WHERE id=?",
+            [
+                ('["gaming","laptop","nvidia","high performance"]','["gaming","3d development","ai workloads","rendering"]',"mid_range","high","lenovo-rtx5060-32gb"),
+                ('["gaming","laptop","nvidia","high performance"]','["gaming","3d development","ai workloads","rendering"]',"premium","high","lenovo-rtx5070-32gb"),
+                ('["gaming","laptop","nvidia","high performance"]','["gaming","3d development","ai workloads","rendering"]',"premium","very high","lenovo-rtx5070ti-32gb"),
+                ('["gaming","laptop","nvidia","high performance"]','["gaming","3d development","ai workloads","rendering"]',"premium","very high","lenovo-rtx5080-32gb"),
+                ('["gaming","laptop","nvidia","high performance"]','["gaming","3d development","ai workloads","rendering"]',"premium","enthusiast","lenovo-rtx5090-32gb"),
+                ('["office","laptop","used","everyday"]','["office","productivity","light tasks"]',"budget","entry level","hp-840g5-i5-8350u"),
+                ('["office","laptop","used","everyday"]','["office","productivity","light tasks"]',"budget","entry level","hp-840g5-i5-8250u"),
+                ('["office","laptop","used","everyday"]','["office","productivity","light tasks"]',"budget","mid range","hp-840g5-i7-8650u"),
             ],
         )
 
