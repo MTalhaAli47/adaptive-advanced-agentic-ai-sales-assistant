@@ -71,6 +71,14 @@ class CheckoutCreate(BaseModel):
     payment_method: Literal["cash_on_delivery", "bank_transfer"]
 
 
+class LeadUpdate(BaseModel):
+    status: Literal["new", "qualifying", "qualified", "nurture", "converted", "lost"] | None = None
+    priority: Literal["low", "medium", "high"] | None = None
+    assigned_to: str | None = Field(default=None, max_length=120)
+    notes: str | None = Field(default=None, max_length=4000)
+    follow_up_at: str | None = Field(default=None, max_length=120)
+
+
 class ProductCreate(BaseModel):
     id: str | None = Field(default=None, min_length=2, max_length=120)
     name: str = Field(min_length=2, max_length=200)

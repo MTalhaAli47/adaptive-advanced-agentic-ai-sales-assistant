@@ -49,9 +49,12 @@ Open `http://127.0.0.1:8000/docs` for the API interface. SQLite data is stored i
 - `GET /api/v1/products?q=solar`
 - `GET /api/v1/products/{product_id}/related`
 - `GET /api/v1/customers/{customer_id}/orders` (requires `X-Customer-Token`)
-- `/cart` and `/api/v1/carts/{customer_id}` (cart and checkout APIs)
+- `/cart` and `/api/v1/carts/{customer_id}` (cart APIs require `X-Customer-Token`)
+- `POST /api/v1/order-reviews/{review_id}/confirm?customer_id=...` (explicit customer confirmation required)
+- `POST /api/v1/order-reviews/{review_id}/cancel?customer_id=...`
 - `GET /api/v1/sales/workspace`
 - `GET /api/v1/sales/handoffs`
+- `GET /api/v1/sales/leads` and `PATCH /api/v1/sales/leads/{lead_id}`
 - `GET /api/v1/admin/orders`
 - `GET /api/v1/admin/appointments`
 - `GET /api/v1/admin/summary`
@@ -70,6 +73,8 @@ The API is channel-neutral. Do not build separate customer or salesperson backen
 ## Current limits
 
 This is a runnable starter MVP, not a production deployment. Customer order history is protected by a random token returned once when the customer profile is created; the browser stores it locally and sends it only for order tracking. Admin and salesperson APIs use separate HTTP Basic credentials when passwords are configured. Set `ADMIN_LOGIN_ID`, `ADMIN_LOGIN_PASSWORD`, `SALESPERSON_LOGIN_ID`, and `SALESPERSON_LOGIN_PASSWORD` in `.env`; the page prompts for the matching login and displays staff IDs (`admin-001` and `sales-001`). Do not use the development bypass in production: set `ENVIRONMENT=production` and configure both passwords. Use HTTPS when exposing these pages beyond a local machine. The `/admin` page records staff-confirmed appointment/order/payment states; it does not collect or verify payments. The sample catalogue is placeholder data and should be replaced with approved products and prices. Related recommendations only include active database products with an explicit relationship or matching metadata; the initial sample catalogue has no accessories linked yet. See [the architecture notes](docs/architecture.md) for boundaries and risks.
+
+Order intents first create a persisted review. Only a token-authenticated explicit confirmation creates the pending order request; prices and availability are checked again at confirmation. Chat and cart checkout use the same confirmation gate. Salesperson leads are one-per-customer records with explainable, fact-based qualification and follow-up fields. See [the reliability audit](docs/RELIABILITY_AUDIT.md) for findings and remaining limitations.
 
 The current catalogue is structured SQL data, so product discovery uses direct database filtering and does not need vector RAG. Add RAG when there are approved product manuals, FAQs, policies, or other long-form sales documents to retrieve from; keep price and stock checks grounded in the live catalogue.
 

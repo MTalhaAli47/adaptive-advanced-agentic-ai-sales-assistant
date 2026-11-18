@@ -149,6 +149,30 @@ def test_frustration_takes_priority_over_an_unanswered_appointment_question():
     assert choose_next_action(context, "engaged", "what's wrong with you? what's wrong with you?")["action"] == "apology"
 
 
+@pytest.mark.parametrize(("message", "expected"), [
+    ("quarter a million", 250000), ("half a million", 500000),
+    ("10-15 alkh", 1500000), ("6–7 lakh", 700000),
+])
+def test_budget_parser_handles_common_language_and_typos(message, expected):
+    context = {"awaiting_field": "budget"}
+    result = extract_context(message, context)
+    assert result["budget_max_pkr"] == expected
+
+
+def test_storage_specification_is_not_mistaken_for_a_budget():
+    result = extract_context("I need 512GB SSD", {"product_category": "laptops", "awaiting_field": "budget"})
+    assert result["minimum_storage_gb"] == 512
+    assert result.get("budget_max_pkr") is None
+    assert result["product_category"] == "laptops"
+
+
+def test_order_review_confirmation_is_context_bound_and_cancelable():
+    context = {"pending_order_review": {"review_id": "review-123"}}
+    assert choose_next_action(context, "engaged", "yes") ["action"] == "confirm_order_review"
+    assert choose_next_action(context, "engaged", "cancel order") ["action"] == "cancel_order_review"
+    assert choose_next_action({}, "engaged", "yes") ["action"] != "confirm_order_review"
+
+
 def test_category_switch_resets_old_budget_but_keeps_followup_questions_scoped():
     context = {"product_category": "cars", "budget_max_pkr": 3_000_000}
     extract_context("Do you have laptops?", context)

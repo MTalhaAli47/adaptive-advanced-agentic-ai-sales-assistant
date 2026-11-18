@@ -190,14 +190,13 @@ def test_handoff_appointment_and_order_boundaries(client):
     assert handoff["handoff_required"] is True
     appointment = client.post(f"/api/v1/appointments/{customer_id}", json={"requested_time": "Friday 3pm"}).json()
     assert appointment["status"] == "requested"
-    order = client.post(f"/api/v1/orders/{customer_id}", json={"product_id": "lenovo-rtx5060-32gb", "quantity": 1}).json()
-    assert order["status"] == "pending_confirmation"
-    assert order["payment_status"] == "not_paid"
-    assert "no payment" in order["message"].lower()
+    order = client.post(f"/api/v1/orders/{customer_id}", headers={"X-Customer-Token": customer["customer_token"]}, json={"product_id": "lenovo-rtx5060-32gb", "quantity": 1}).json()
+    assert order["status"] == "pending"
+    assert "explicitly confirm" in order["message"].lower()
     summary = client.get("/api/v1/dashboard/summary").json()
     assert summary["handoffs"] == 1
     assert summary["appointments_to_confirm"] == 1
-    assert summary["orders_pending_approval"] == 1
+    assert summary["orders_pending_approval"] == 0
 
 
 def test_handoff_appears_by_customer_name_and_salesperson_can_reply(client):
@@ -250,13 +249,17 @@ def test_order_request_creates_pending_order_and_admin_can_confirm_and_record_pa
     customer_id = customer["id"]
     recommended = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "I need a gaming laptop RTX 5060"}).json()
     assert recommended["next_action"]["action"] == "recommend"
+    headers = {"X-Customer-Token": customer["customer_token"]}
     order_reply = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place my order"}).json()
-    assert order_reply["next_action"]["action"] == "order_created"
-    assert "awaiting salesperson confirmation" in order_reply["reply"]
-    assert "no payment has been taken" in order_reply["reply"].lower()
+    assert order_reply["next_action"]["action"] == "order_review"
+    assert "please review" in order_reply["reply"].lower()
+    assert "no order or payment has been created" in order_reply["reply"].lower()
     duplicate = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place my order"}).json()
-    assert duplicate["next_action"]["action"] == "order_existing"
-    assert "haven’t created a duplicate" in duplicate["reply"]
+    assert duplicate["next_action"]["action"] == "order_review_pending"
+    assert client.get("/api/v1/admin/orders").json() == []
+    confirmed_request = client.post(f"/api/v1/conversations/{customer_id}/messages", headers=headers, json={"message": "confirm order"}).json()
+    assert "awaiting salesperson confirmation" in confirmed_request["reply"]
+    assert "no payment has been taken" in confirmed_request["reply"].lower()
 
     orders = client.get("/api/v1/admin/orders").json()
     assert len(orders) == 1
@@ -279,9 +282,11 @@ def test_order_request_creates_pending_order_and_admin_can_confirm_and_record_pa
 
 def test_admin_rejects_invalid_or_null_order_states(client):
     customer = client.post("/api/v1/customers", json={"name": "Validation customer", "channel": "web"}).json()
-    order = client.post("/api/v1/orders/" + customer["id"], json={"product_id": "lenovo-rtx5060-32gb"}).json()
-    invalid = client.patch(f"/api/v1/admin/orders/{order['id']}", json={"status": "maybe"})
-    null_status = client.patch(f"/api/v1/admin/orders/{order['id']}", json={"status": None})
+    review = client.post("/api/v1/orders/" + customer["id"], headers={"X-Customer-Token": customer["customer_token"]}, json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    created = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers={"X-Customer-Token": customer["customer_token"]}).json()
+    order_id = created["order_ids"][0]
+    invalid = client.patch(f"/api/v1/admin/orders/{order_id}", json={"status": "maybe"})
+    null_status = client.patch(f"/api/v1/admin/orders/{order_id}", json={"status": None})
     assert invalid.status_code == 422
     assert null_status.status_code == 422
 
@@ -294,9 +299,19 @@ def test_ambiguous_order_requires_customer_to_choose_an_offered_product(client):
     assert choice["next_action"]["action"] == "select_product"
     assert "Reply with the model name" in choice["reply"]
     placed = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "1"}).json()
-    assert placed["next_action"]["action"] == "order_created"
-    assert placed["next_action"]["product"]["gpu_model"] == "RTX 5060"
-    assert len(client.get("/api/v1/admin/orders").json()) == 1
+    assert placed["next_action"]["action"] == "order_review"
+    assert placed["next_action"]["items"][0]["product_id"] == "lenovo-rtx5060-32gb"
+    assert len(client.get("/api/v1/admin/orders").json()) == 0
+
+
+def test_misspelled_ordinal_resolves_against_persisted_product_list(client):
+    customer = client.post("/api/v1/customers", json={"name": "Ordinal buyer", "channel": "web"}).json()
+    cid = customer["id"]
+    client.post(f"/api/v1/conversations/{cid}/messages", json={"message": "I need a gaming laptop"})
+    client.post(f"/api/v1/conversations/{cid}/messages", json={"message": "place my order"})
+    selected = client.post(f"/api/v1/conversations/{cid}/messages", json={"message": "5th"}).json()
+    assert selected["next_action"]["action"] == "order_review"
+    assert selected["next_action"]["items"][0]["product_id"] == "lenovo-rtx5090-32gb"
 
 
 def test_existing_orders_migrate_into_admin_payment_fields(client):
@@ -367,6 +382,16 @@ def test_customer_can_request_appointment_and_admin_can_confirm_it(client):
     assert "confirmed your appointment" in history[-1]["content"]
 
 
+def test_duplicate_appointment_request_reuses_existing_record(client):
+    customer = client.post("/api/v1/customers", json={"name": "Appointment buyer", "channel": "web"}).json()
+    cid = customer["id"]
+    first = client.post(f"/api/v1/appointments/{cid}", json={"requested_time": "Friday 3pm"}).json()
+    second = client.post(f"/api/v1/appointments/{cid}", json={"requested_time": "Friday 3pm"}).json()
+    assert second["id"] == first["id"]
+    assert second["duplicate"] is True
+    assert len([item for item in client.get("/api/v1/admin/appointments").json() if item["customer_id"] == cid]) == 1
+
+
 def test_customer_can_finish_order_during_a_salesperson_handoff(client):
     customer = client.post("/api/v1/customers", json={"name": "Handed off buyer", "channel": "web"}).json()
     customer_id = customer["id"]
@@ -375,8 +400,8 @@ def test_customer_can_finish_order_during_a_salesperson_handoff(client):
     sales_reply = client.post(f"/api/v1/sales/{customer_id}/messages", json={"message": "I can help with the order."})
     assert sales_reply.status_code == 200
     placed = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place my order"}).json()
-    assert placed["next_action"]["action"] == "order_created"
-    assert placed["handoff_required"] is False
+    assert placed["next_action"]["action"] == "order_review"
+    assert placed["handoff_required"] is True
     assert len(client.get("/api/v1/sales/handoffs").json()["handoffs"]) == 1
 
 
@@ -393,22 +418,28 @@ def test_legacy_handoff_bot_product_category_is_repaired(client):
 def test_cart_add_update_remove_and_checkout_creates_unpaid_orders(client):
     customer = client.post("/api/v1/customers", json={"name": "Cart buyer", "channel": "web"}).json()
     customer_id = customer["id"]
-    added = client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "lenovo-rtx5060-32gb", "quantity": 1})
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    added = client.post(f"/api/v1/carts/{customer_id}/items", headers=headers, json={"product_id": "lenovo-rtx5060-32gb", "quantity": 1})
     assert added.status_code == 200
-    added = client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "lenovo-rtx5060-32gb", "quantity": 2}).json()
+    added = client.post(f"/api/v1/carts/{customer_id}/items", headers=headers, json={"product_id": "lenovo-rtx5060-32gb", "quantity": 2}).json()
     assert added["items"][0]["quantity"] == 3
     assert added["subtotal"] == 2_040_000
-    updated = client.patch(f"/api/v1/carts/{customer_id}/items/lenovo-rtx5060-32gb", json={"quantity": 1}).json()
+    updated = client.patch(f"/api/v1/carts/{customer_id}/items/lenovo-rtx5060-32gb", headers=headers, json={"quantity": 1}).json()
     assert updated["items"][0]["quantity"] == 1
-    client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "hp-840g5-i5-8350u", "quantity": 1})
-    checkout = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "cash_on_delivery"})
+    client.post(f"/api/v1/carts/{customer_id}/items", headers=headers, json={"product_id": "hp-840g5-i5-8350u", "quantity": 1})
+    checkout = client.post(f"/api/v1/carts/{customer_id}/checkout", headers=headers, json={"payment_method": "cash_on_delivery"})
     assert checkout.status_code == 201
     body = checkout.json()
-    assert body["payment_status"] == "not_paid"
+    assert body["status"] == "pending"
+    assert body["message"].startswith("Review this summary")
     assert len(body["items"]) == 2
-    assert client.get(f"/api/v1/carts/{customer_id}").json()["items"] == []
+    assert len(client.get(f"/api/v1/carts/{customer_id}", headers=headers).json()["items"]) == 2
+    assert client.get("/api/v1/admin/orders").json() == []
+    confirmed = client.post(f"/api/v1/order-reviews/{body['review_id']}/confirm?customer_id={customer_id}", headers=headers).json()
+    assert confirmed["payment_status"] == "not_paid"
+    assert client.get(f"/api/v1/carts/{customer_id}", headers=headers).json()["items"] == []
     orders = client.get("/api/v1/admin/orders").json()
-    created = [order for order in orders if order.get("checkout_id") == body["checkout_id"]]
+    created = [order for order in orders if order["id"] in confirmed["order_ids"]]
     assert len(created) == 2
     assert all(order["status"] == "pending_confirmation" and order["payment_status"] == "not_paid" for order in created)
 
@@ -416,11 +447,14 @@ def test_cart_add_update_remove_and_checkout_creates_unpaid_orders(client):
 def test_bank_transfer_checkout_requests_sales_help_and_empty_checkout_fails(client):
     customer = client.post("/api/v1/customers", json={"name": "Transfer buyer", "channel": "web"}).json()
     customer_id = customer["id"]
-    empty = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "bank_transfer"})
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    empty = client.post(f"/api/v1/carts/{customer_id}/checkout", headers=headers, json={"payment_method": "bank_transfer"})
     assert empty.status_code == 400
-    client.post(f"/api/v1/carts/{customer_id}/items", json={"product_id": "hp-840g5-i5-8350u"})
-    result = client.post(f"/api/v1/carts/{customer_id}/checkout", json={"payment_method": "bank_transfer"}).json()
-    assert result["payment_status"] == "not_paid"
+    client.post(f"/api/v1/carts/{customer_id}/items", headers=headers, json={"product_id": "hp-840g5-i5-8350u"})
+    result = client.post(f"/api/v1/carts/{customer_id}/checkout", headers=headers, json={"payment_method": "bank_transfer"}).json()
+    assert result["status"] == "pending"
+    assert client.get("/api/v1/sales/handoffs").json()["handoffs"] == []
+    client.post(f"/api/v1/order-reviews/{result['review_id']}/confirm?customer_id={customer_id}", headers=headers)
     handoffs = client.get("/api/v1/sales/handoffs").json()["handoffs"]
     assert any(item["customer"]["id"] == customer_id for item in handoffs)
 
@@ -436,23 +470,25 @@ def test_cart_and_checkout_pages_are_available(client):
 def test_customer_order_history_is_limited_to_its_private_customer_token(client):
     first = client.post("/api/v1/customers", json={"name": "First", "channel": "web"}).json()
     second = client.post("/api/v1/customers", json={"name": "Second", "channel": "web"}).json()
-    created = client.post(f"/api/v1/orders/{first['id']}", json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    review = client.post(f"/api/v1/orders/{first['id']}", headers={"X-Customer-Token": first["customer_token"]}, json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    confirmed = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={first['id']}", headers={"X-Customer-Token": first["customer_token"]}).json()
     unauthenticated = client.get(f"/api/v1/customers/{first['id']}/orders")
     assert unauthenticated.status_code == 401
     cross_account = client.get(f"/api/v1/customers/{first['id']}/orders", headers={"X-Customer-Token": second["customer_token"]})
     assert cross_account.status_code == 401
     own_orders = client.get(f"/api/v1/customers/{first['id']}/orders", headers={"X-Customer-Token": first["customer_token"]})
-    assert [order["id"] for order in own_orders.json()] == [created["id"]]
+    assert [order["id"] for order in own_orders.json()] == confirmed["order_ids"]
     assert first["user_id"] == first["id"]
 
 
 def test_chat_order_tracking_requires_private_token_and_lists_only_owned_orders(client):
     customer = client.post("/api/v1/customers", json={"name": "Order tracker", "channel": "web"}).json()
-    order = client.post(f"/api/v1/orders/{customer['id']}", json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    review = client.post(f"/api/v1/orders/{customer['id']}", headers={"X-Customer-Token": customer["customer_token"]}, json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    order = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers={"X-Customer-Token": customer["customer_token"]}).json()
     denied = client.post(f"/api/v1/conversations/{customer['id']}/messages", json={"message": "track my order"})
     assert denied.status_code == 401
     response = client.post(f"/api/v1/conversations/{customer['id']}/messages", headers={"X-Customer-Token": customer["customer_token"]}, json={"message": "track my order"}).json()
-    assert order["id"][:8] in response["reply"]
+    assert order["order_ids"][0][:8] in response["reply"]
     assert "pending confirmation" in response["reply"]
 
 
@@ -476,7 +512,7 @@ def test_chat_can_add_last_recommended_product_to_cart_while_requesting_staff(cl
     response = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "add it to cart and ask salesperson to confirm availability"}).json()
     assert response["handoff_required"] is True
     assert "Added" in response["reply"] and "salesperson" in response["reply"]
-    cart = client.get(f"/api/v1/carts/{customer_id}").json()
+    cart = client.get(f"/api/v1/carts/{customer_id}", headers={"X-Customer-Token": customer["customer_token"]}).json()
     assert len(cart["items"]) == 1
 
 
@@ -487,12 +523,87 @@ def test_customer_can_explicitly_start_a_second_order_for_the_same_product(clien
     first_prompt = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place my order"}).json()
     assert first_prompt["next_action"]["action"] == "select_product"
     first = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "1"}).json()
-    assert first["next_action"]["action"] == "order_created"
+    assert first["next_action"]["action"] == "order_review"
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    client.post(f"/api/v1/conversations/{customer_id}/messages", headers=headers, json={"message": "confirm order"})
     second_prompt = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "place another order"}).json()
     assert second_prompt["next_action"]["action"] == "select_product"
     second = client.post(f"/api/v1/conversations/{customer_id}/messages", json={"message": "1"}).json()
-    assert second["next_action"]["action"] == "order_created"
-    assert second["next_action"]["order_id"] != first["next_action"]["order_id"]
+    assert second["next_action"]["action"] == "order_review"
+    assert second["next_action"]["review_id"] != first["next_action"]["review_id"]
+
+
+def test_order_requires_review_owner_confirmation_and_is_idempotent(client):
+    customer = client.post("/api/v1/customers", json={"name": "Review buyer", "channel": "web"}).json()
+    other = client.post("/api/v1/customers", json={"name": "Other buyer", "channel": "web"}).json()
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    review = client.post(f"/api/v1/orders/{customer['id']}", headers=headers, json={"product_id": "lenovo-rtx5060-32gb", "quantity": 2}).json()
+    assert review["status"] == "pending"
+    assert review["subtotal"] == 1_360_000
+    assert client.get("/api/v1/admin/orders").json() == []
+    denied = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers={"X-Customer-Token": other["customer_token"]})
+    assert denied.status_code == 401
+    confirmed = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers=headers).json()
+    retry = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers=headers).json()
+    assert retry["already_confirmed"] is True
+    assert retry["order_ids"] == confirmed["order_ids"]
+    assert len(client.get("/api/v1/admin/orders").json()) == 1
+
+
+def test_cart_edits_invalidate_order_review_and_private_cart_routes_require_token(client):
+    customer = client.post("/api/v1/customers", json={"name": "Cart review", "channel": "web"}).json()
+    cid = customer["id"]
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    assert client.get(f"/api/v1/carts/{cid}").status_code == 401
+    client.post(f"/api/v1/carts/{cid}/items", headers=headers, json={"product_id": "lenovo-rtx5060-32gb"})
+    review = client.post(f"/api/v1/carts/{cid}/checkout", headers=headers, json={"payment_method": "cash_on_delivery"}).json()
+    client.post(f"/api/v1/carts/{cid}/items", headers=headers, json={"product_id": "hp-840g5-i5-8350u"})
+    confirm = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={cid}", headers=headers)
+    assert confirm.status_code == 409
+    assert client.get("/api/v1/admin/orders").json() == []
+
+
+def test_customer_price_change_invalidates_review_before_order_creation(client):
+    customer = client.post("/api/v1/customers", json={"name": "Price changed", "channel": "web"}).json()
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    review = client.post(f"/api/v1/orders/{customer['id']}", headers=headers, json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    with sqlite3.connect("test.db") as db:
+        db.execute("UPDATE products SET price=690000 WHERE id='lenovo-rtx5060-32gb'")
+    result = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers=headers)
+    assert result.status_code == 409
+    assert client.get("/api/v1/admin/orders").json() == []
+
+
+def test_order_payment_and_fulfillment_transitions_require_confirmation(client):
+    customer = client.post("/api/v1/customers", json={"name": "State guard", "channel": "web"}).json()
+    headers = {"X-Customer-Token": customer["customer_token"]}
+    review = client.post(f"/api/v1/orders/{customer['id']}", headers=headers, json={"product_id": "lenovo-rtx5060-32gb"}).json()
+    created = client.post(f"/api/v1/order-reviews/{review['review_id']}/confirm?customer_id={customer['id']}", headers=headers).json()
+    order_id = created["order_ids"][0]
+    assert client.patch(f"/api/v1/admin/orders/{order_id}", json={"payment_status": "paid"}).status_code == 409
+    assert client.patch(f"/api/v1/admin/orders/{order_id}", json={"fulfillment_status": "shipped"}).status_code == 409
+    assert client.patch(f"/api/v1/admin/orders/{order_id}", json={"status": "confirmed"}).status_code == 200
+    assert client.patch(f"/api/v1/admin/orders/{order_id}", json={"payment_status": "paid"}).status_code == 200
+    assert client.patch(f"/api/v1/admin/orders/{order_id}", json={"payment_status": "not_paid"}).status_code == 409
+
+
+def test_leads_are_qualified_from_stated_facts_and_salesperson_can_manage_them(client):
+    customer = client.post("/api/v1/customers", json={"name": "Ready buyer", "channel": "web"}).json()
+    client.post(f"/api/v1/conversations/{customer['id']}/messages", json={"message": "I want to buy a gaming laptop for 3D work within 7 lakh today"})
+    leads = client.get("/api/v1/sales/leads").json()
+    assert len(leads) == 1
+    lead = leads[0]
+    assert lead["customer_id"] == customer["id"]
+    assert lead["status"] == "qualified"
+    assert lead["priority"] == "high"
+    assert "budget" in lead["qualification_reason"]
+    updated = client.patch(f"/api/v1/sales/leads/{lead['id']}", json={"status": "nurture", "follow_up_at": "2026-11-20T15:00"}).json()
+    assert updated["status"] == "nurture"
+    assert updated["follow_up_at"] == "2026-11-20T15:00"
+    assert updated["updated_by_user_id"] == "sales-001"
+    client.post(f"/api/v1/conversations/{customer['id']}/messages", json={"message": "Actually office laptop"})
+    assert client.get("/api/v1/sales/leads?status=nurture").json()[0]["status"] == "nurture"
+    assert client.get("/api/v1/sales/leads?status=nurture&priority=high").json()[0]["id"] == lead["id"]
 
 
 def test_better_option_respects_budget_and_can_expand_results_on_request(client):

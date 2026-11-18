@@ -1,6 +1,8 @@
 (() => {
   const API = '/api/v1';
   const money = (amount, currency = 'PKR') => `${currency} ${Number(amount || 0).toLocaleString()}`;
+  let pendingReview = null;
+  const safe = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   async function ensureCustomer() {
     let id = localStorage.getItem('aisa_customer_id');
     if (id && localStorage.getItem('aisa_customer_token')) return id;
@@ -15,6 +17,11 @@
     return id;
   }
   async function api(url, options = {}) {
+    if (String(url).includes('/carts/')) {
+      const headers = new Headers(options.headers || {});
+      headers.set('X-Customer-Token', localStorage.getItem('aisa_customer_token') || '');
+      options = {...options, headers};
+    }
     const response = await fetch(url, options);
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.detail || 'Something went wrong. Please try again.');
@@ -80,10 +87,25 @@
       try {
         const id = await ensureCustomer();
         const result = await api(`${API}/carts/${id}/checkout`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment_method:document.querySelector('#payment-method').value})});
+        pendingReview = {id, ...result};
+        document.querySelector('#order-review').hidden = false;
+        document.querySelector('#order-review').innerHTML = `<h2>Please review your order</h2>${result.items.map(item=>`<p>• ${safe(item.name)} — ${item.quantity} × ${money(item.unit_price,item.currency)} = <strong>${money(item.line_total,item.currency)}</strong></p>`).join('')}<p><strong>Subtotal and total: ${money(result.subtotal,result.currency)}</strong></p><p class="muted">Delivery and taxes are not included because they have not been verified. No order or payment has been created yet.</p><button id="confirm-order" class="button" type="button">Confirm order request</button> <button id="cancel-review" class="button secondary" type="button">Cancel</button>`;
+        status.textContent = 'Check the item, quantity, and total, then confirm if everything is correct.';
         document.querySelector('#checkout-panel').hidden = true;
-        document.querySelector('#cart-items').replaceChildren();
-        status.className = 'checkout-success';
-        status.textContent = `Order request ${result.checkout_id.slice(0,8)} received. ${result.message} Your total is ${money(result.subtotal, result.currency)}.`;
+        document.querySelector('#confirm-order').addEventListener('click', async event => {
+          const confirmButton=event.currentTarget;confirmButton.disabled=true;
+          try {
+            const token=localStorage.getItem('aisa_customer_token');
+            const result=await api(`${API}/order-reviews/${encodeURIComponent(pendingReview.review_id)}/confirm?customer_id=${encodeURIComponent(pendingReview.id)}`,{method:'POST',headers:{'X-Customer-Token':token||''}});
+            document.querySelector('#order-review').hidden=true;document.querySelector('#order-review').replaceChildren();pendingReview=null;
+            await renderCart();
+            status.className='checkout-success';status.textContent=`Order request ${String(result.order_ids?.[0]||'').slice(0,8)} recorded. A salesperson must confirm availability. No payment has been taken.`;
+          } catch(error){status.textContent=error.message;confirmButton.disabled=false}
+        });
+        document.querySelector('#cancel-review').addEventListener('click',async()=>{
+          const token=localStorage.getItem('aisa_customer_token');
+          try{await api(`${API}/order-reviews/${encodeURIComponent(pendingReview.review_id)}/cancel?customer_id=${encodeURIComponent(pendingReview.id)}`,{method:'POST',headers:{'X-Customer-Token':token||''}});pendingReview=null;document.querySelector('#order-review').hidden=true;await renderCart();status.textContent='Order review cancelled. Your cart is unchanged.'}catch(error){status.textContent=error.message}
+        });
       } catch (e) { status.textContent = e.message; }
       finally { button.disabled = false; }
     });

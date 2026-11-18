@@ -1,6 +1,7 @@
 import json
 import difflib
 import hashlib
+import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from app.config import get_settings
 from app.db import connect, decode_context, initialize_database
 from app.recommendations import recommend_related_products
 from app.sales import CART_RE, choose_next_action, extract_context, stage_after_message
-from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, CartItemCreate, CartItemUpdate, CheckoutCreate, ConversationReply, CustomerCreate, CustomerOut, MessageIn, OrderCreate, ProductCreate, ProductRelationshipCreate
+from app.schemas import AdminAppointmentUpdate, AdminOrderUpdate, AppointmentCreate, CartItemCreate, CartItemUpdate, CheckoutCreate, ConversationReply, CustomerCreate, CustomerOut, LeadUpdate, MessageIn, OrderCreate, ProductCreate, ProductRelationshipCreate
 
 settings = get_settings()
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
@@ -31,6 +32,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+logger = logging.getLogger("aisa.conversation")
 staff_security = HTTPBasic(auto_error=False)
 
 
@@ -99,6 +101,122 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def prepare_order_review(db, customer_id: str, items: list[dict], payment_method: str = "cash_on_delivery", *, source: str = "chat") -> dict:
+    if not items:
+        raise HTTPException(status_code=400, detail="There are no items to review")
+    checked = []
+    currency = None
+    for item in items:
+        product = db.execute("SELECT id,name,price,currency,active FROM products WHERE id=?", (item["product_id"],)).fetchone()
+        if not product or not product["active"]:
+            raise HTTPException(status_code=409, detail="An item in this order is no longer available. Please update your cart.")
+        if product["price"] is None:
+            raise HTTPException(status_code=409, detail=f"{product['name']} needs a salesperson quote before ordering")
+        quantity = int(item["quantity"])
+        checked.append({"product_id": product["id"], "name": product["name"], "quantity": quantity,
+                        "unit_price": float(product["price"]), "currency": product["currency"],
+                        "line_total": float(product["price"]) * quantity})
+        currency = product["currency"]
+    currencies = {item["currency"] for item in checked}
+    if len(currencies) != 1:
+        raise HTTPException(status_code=409, detail="The cart has mixed currencies and cannot be reviewed as one order")
+    review_id = str(uuid4())
+    subtotal = sum(item["line_total"] for item in checked)
+    stamp = now()
+    for previous in db.execute("SELECT * FROM order_reviews WHERE customer_id=? AND source=? AND payment_method=? AND status='pending' ORDER BY created_at DESC", (customer_id, source, payment_method)).fetchall():
+        if json.loads(previous["items_json"]) == checked:
+            return {"review_id": previous["id"], "customer_id": customer_id, "items": checked, "subtotal": previous["subtotal"],
+                    "currency": previous["currency"], "payment_method": previous["payment_method"], "status": "pending",
+                    "message": "An identical order summary is already awaiting your confirmation."}
+    db.execute("INSERT INTO order_reviews(id,customer_id,items_json,subtotal,currency,payment_method,source,status,created_at) VALUES(?,?,?,?,?,?,?,'pending',?)",
+               (review_id, customer_id, json.dumps(checked), subtotal, currency or "PKR", payment_method, source, stamp))
+    return {"review_id": review_id, "customer_id": customer_id, "items": checked, "subtotal": subtotal,
+            "currency": currency or "PKR", "payment_method": payment_method, "status": "pending",
+            "message": "Review this summary. No order has been placed and no payment has been taken."}
+
+
+def confirm_order_review(db, customer_id: str, review_id: str) -> dict:
+    review = db.execute("SELECT * FROM order_reviews WHERE id=? AND customer_id=?", (review_id, customer_id)).fetchone()
+    if not review:
+        raise HTTPException(status_code=404, detail="Order review not found")
+    if review["status"] == "confirmed":
+        refs = json.loads(review["checkout_id"] or "[]")
+        return {"review_id": review_id, "status": "confirmed", "order_ids": refs, "already_confirmed": True}
+    if review["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"This order review is {review['status']} and cannot be confirmed")
+    items = json.loads(review["items_json"])
+    if review["source"] == "cart":
+        cart = cart_snapshot(db, customer_id)
+        current = sorted((item["product_id"], item["quantity"], float(item["line_total"])) for item in cart["items"])
+        expected = sorted((item["product_id"], item["quantity"], float(item["line_total"])) for item in items)
+        if current != expected:
+            db.execute("UPDATE order_reviews SET status='invalidated' WHERE id=?", (review_id,))
+            return {"error": "Your cart changed after this review. Please review the updated cart before confirming."}
+    stamp, checkout_id, order_ids = now(), str(uuid4()), []
+    for item in items:
+        product = db.execute("SELECT price,currency,active FROM products WHERE id=?", (item["product_id"],)).fetchone()
+        if not product or not product["active"] or float(product["price"] or -1) != float(item["unit_price"]) or product["currency"] != item["currency"]:
+            db.execute("UPDATE order_reviews SET status='invalidated' WHERE id=?", (review_id,))
+            return {"error": "Catalogue price or availability changed. Please prepare a fresh order review."}
+        order_id = str(uuid4())
+        db.execute("INSERT INTO orders(id,checkout_id,customer_id,product_id,quantity,status,payment_status,payment_method,created_at,updated_at) VALUES(?,?,?,?,?,'pending_confirmation','not_paid',?,?,?)",
+                   (order_id, checkout_id, customer_id, item["product_id"], item["quantity"], review["payment_method"], stamp, stamp))
+        order_ids.append(order_id)
+    db.execute("UPDATE order_reviews SET status='confirmed',checkout_id=?,confirmed_at=? WHERE id=?", (json.dumps(order_ids), stamp, review_id))
+    if review["source"] == "cart":
+        db.execute("DELETE FROM cart_items WHERE customer_id=?", (customer_id,))
+    if review["payment_method"] == "bank_transfer":
+        customer = db.execute("SELECT context_json FROM customers WHERE id=?", (customer_id,)).fetchone()
+        context = decode_context(customer["context_json"])
+        context["handoff_reason"] = "Confirmed order needs verified bank transfer instructions from sales."
+        db.execute("UPDATE customers SET handoff_requested=1,sales_stage='human_handoff',context_json=? WHERE id=?", (json.dumps(context), customer_id))
+    return {"review_id": review_id, "checkout_id": checkout_id, "customer_id": customer_id, "order_ids": order_ids,
+            "status": "pending_confirmation", "payment_status": "not_paid", "subtotal": review["subtotal"],
+            "currency": review["currency"], "message": "Order request recorded for salesperson confirmation. No payment has been taken."}
+
+
+def qualify_context(context: dict) -> dict:
+    evidence = []
+    score = 0
+    if context.get("product_category"):
+        score += 20
+        evidence.append("stated product/service interest")
+    if context.get("use_case"):
+        score += 10
+        evidence.append("stated use case")
+    if context.get("budget_max_pkr") is not None or context.get("budget_flexible"):
+        score += 20
+        evidence.append("provided budget guidance")
+    if context.get("intent") == "purchase" or context.get("last_order_id"):
+        score += 25
+        evidence.append("expressed purchase intent")
+    if context.get("timeline") or context.get("urgency"):
+        score += 15
+        evidence.append("shared a purchase timeline or urgency")
+    if context.get("pending_appointment") or context.get("last_appointment_id") or context.get("intent") == "human_handoff":
+        score += 10
+        evidence.append("requested a meeting or salesperson assistance")
+    status = "qualified" if score >= 65 and context.get("product_category") and (context.get("intent") == "purchase" or context.get("last_order_id")) else "qualifying" if score else "new"
+    priority = "high" if score >= 65 else "medium" if score >= 35 else "low"
+    missing = [label for key, label in (("budget_max_pkr", "budget"), ("timeline", "purchase timeline")) if context.get(key) is None and not context.get("budget_flexible")]
+    reason = "; ".join(evidence) if evidence else "No qualifying details have been captured yet"
+    if missing:
+        reason += "; still unknown: " + ", ".join(missing)
+    return {"score": score, "status": status, "priority": priority, "qualification_reason": reason}
+
+
+def update_customer_lead(db, customer_id: str, context: dict, stamp: str) -> None:
+    if not any(context.get(key) for key in ("product_category", "intent", "last_order_id", "pending_appointment", "handoff_reason")):
+        return
+    evaluation = qualify_context(context)
+    db.execute("""INSERT INTO leads(id,customer_id,status,score,priority,qualification_reason,updated_at,created_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(customer_id) DO UPDATE SET
+        status=CASE WHEN leads.qualification_overridden=1 OR leads.status IN ('converted','lost') THEN leads.status ELSE excluded.status END,
+        score=excluded.score,priority=CASE WHEN leads.priority_overridden=1 THEN leads.priority ELSE excluded.priority END,
+        qualification_reason=excluded.qualification_reason,updated_at=excluded.updated_at""",
+        (str(uuid4()), customer_id, evaluation["status"], evaluation["score"], evaluation["priority"], evaluation["qualification_reason"], stamp, stamp))
+
+
 def customer_from_row(row) -> CustomerOut:
     return CustomerOut(
         id=row["id"], user_id=row["id"], name=row["name"], contact=row["contact"], channel=row["channel"],
@@ -161,6 +279,9 @@ def catalogue_matches(context: dict) -> list[dict]:
     if context.get("minimum_vram_gb") is not None:
         query += " AND vram_gb >= ?"
         params.append(context["minimum_vram_gb"])
+    if context.get("minimum_storage_gb") is not None:
+        query += " AND storage_gb >= ?"
+        params.append(context["minimum_storage_gb"])
     if minimum is not None:
         query += " AND price >= ?"
         params.append(minimum)
@@ -227,9 +348,22 @@ def select_order_product(products: list[dict], message: str, context: dict) -> d
     if not products:
         return None
     lowered = message.casefold()
-    position = re.fullmatch(r"\s*(?:option\s*)?(\d{1,2})[.!\s]*", lowered)
+    position = re.fullmatch(r"\s*(?:option\s*)?(\d{1,2})(?:st|nd|rd|th|rth)?[.!\s]*", lowered)
     if position and 1 <= int(position.group(1)) <= len(products):
         return products[int(position.group(1)) - 1]
+    ordinals = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+                "fourth": 4, "forth": 4, "4th": 4, "4rth": 4, "fifth": 5, "5th": 5,
+                "last": len(products), "last one": len(products), "top": 1, "top one": 1}
+    ordinal_match = re.fullmatch(r"\s*(?:the\s+)?(first|1st|second|2nd|third|3rd|fourth|forth|4th|4rth|fifth|5th|last|last one|top|top one)(?:\s+(?:one|laptop|option|product))?[.!\s]*", lowered)
+    if ordinal_match:
+        index = ordinals[ordinal_match.group(1)]
+        if 1 <= index <= len(products):
+            return products[index - 1]
+    if re.search(r"\b(?:cheapest|lowest price|least expensive)\b", lowered):
+        return min(products, key=lambda item: item.get("price") if item.get("price") is not None else float("inf"))
+    if re.search(r"\b(?:most expensive|highest price)\b", lowered):
+        priced = [item for item in products if item.get("price") is not None]
+        return max(priced, key=lambda item: item["price"]) if priced else None
     gpu_model = context.get("gpu_model")
     if gpu_model and "rtx" in lowered:
         matches = [item for item in products if (item.get("gpu_model") or "").casefold() == gpu_model.casefold()]
@@ -443,6 +577,9 @@ def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | N
     normalize_catalogue_interest(context)
     stage = stage_after_message(context, row["sales_stage"])
     action = choose_next_action(context, stage, payload.message)
+    logger.info("message_routed customer_id=%s channel=%s intent=%s action=%s category=%s budget_max=%s pending=%s",
+                customer_id, row["channel"], context.get("intent"), action.get("action"), context.get("product_category"),
+                context.get("budget_max_pkr"), context.get("awaiting_field"))
     human_requested_this_turn = action["action"] in {"human_handoff", "payment_help"}
     direct_reply = None
     cart_added = None
@@ -548,6 +685,8 @@ def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | N
             action["question"] = f"What product or service are you looking for? The catalogue currently includes {', '.join(categories)}. I can check other items too."
     if action["action"] == "recommend":
         products = catalogue_matches(context)
+        logger.info("catalogue_search customer_id=%s category=%s product_ids=%s result_count=%d",
+                    customer_id, context.get("product_category"), [product["id"] for product in products], len(products))
         action["products"] = products
         context["last_recommended_product_ids"] = [product["id"] for product in products]
         if products:
@@ -578,23 +717,57 @@ def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | N
             action = {"action": "clarify_appointment", "reason": "An appointment time is required.", "question": "What day and time should I request?"}
             context["awaiting_field"] = "appointment_time"
         else:
-            appointment_id, stamp = str(uuid4()), now()
+            stamp = now()
             with connect() as db:
-                db.execute(
-                    "INSERT INTO appointments(id,customer_id,requested_time,created_at) VALUES(?,?,?,?)",
-                    (appointment_id, customer_id, requested_time, stamp),
-                )
+                existing_appointment = db.execute("SELECT id,status FROM appointments WHERE customer_id=? AND requested_time=? AND status IN ('requested','confirmed') ORDER BY created_at DESC LIMIT 1", (customer_id, requested_time)).fetchone()
+                if existing_appointment:
+                    appointment_id = existing_appointment["id"]
+                else:
+                    appointment_id = str(uuid4())
+                    db.execute("INSERT INTO appointments(id,customer_id,requested_time,created_at) VALUES(?,?,?,?)", (appointment_id, customer_id, requested_time, stamp))
             context["last_appointment_id"] = appointment_id
-            context["last_appointment_status"] = "requested"
+            context["last_appointment_status"] = existing_appointment["status"] if existing_appointment else "requested"
             stage = "appointment"
             context.pop("pending_appointment", None)
             context.pop("appointment_requested_time", None)
             context.pop("awaiting_field", None)
             action = {"action": "appointment_created", "appointment_id": appointment_id, "requested_time": requested_time}
-            direct_reply = f"I’ve sent an appointment request for {requested_time}. It’s waiting for the sales team to confirm; this isn’t confirmed on the calendar yet."
+            direct_reply = (f"You already have an appointment for {requested_time}; its status is {existing_appointment['status']}." if existing_appointment
+                            else f"I’ve sent an appointment request for {requested_time}. It’s waiting for the sales team to confirm; this isn’t confirmed on the calendar yet.")
     if action["action"] == "cancel_order_request":
         context.pop("awaiting_field", None)
         direct_reply = "No problem—I haven’t placed an order. Tell me if you’d like to compare another option."
+    if action["action"] == "confirm_order_review":
+        verify_customer_token(customer_id, x_customer_token)
+        pending = context.get("pending_order_review") or {}
+        try:
+            with connect() as db:
+                result = confirm_order_review(db, customer_id, pending.get("review_id", ""))
+            if result.get("error"):
+                raise HTTPException(status_code=409, detail=result["error"])
+            order_id = (result.get("order_ids") or [None])[0]
+            product = (pending.get("items") or [{}])[0]
+            direct_reply = f"Your order request for {product.get('name', 'your items')} is recorded and awaiting salesperson confirmation. No payment has been taken. Reference: {order_id[:8] if order_id else 'see your order history'}."
+            context["last_order_id"] = order_id
+            context["last_order_product_id"] = product.get("product_id")
+            context["last_order_status"] = "pending_confirmation"
+            context.pop("pending_order_review", None)
+            action.update({"order_ids": result.get("order_ids", []), "status": result["status"]})
+            if pending.get("payment_method") == "bank_transfer":
+                context["handoff_reason"] = "Confirmed order needs verified bank transfer instructions from sales."
+                human_requested_this_turn = True
+            stage = "order_pending_confirmation"
+        except HTTPException as error:
+            direct_reply = error.detail
+            context.pop("pending_order_review", None)
+            action = {"action": "order_review_invalidated", "reason": error.detail}
+    if action["action"] == "cancel_order_review":
+        verify_customer_token(customer_id, x_customer_token)
+        pending = context.pop("pending_order_review", None) or {}
+        if pending.get("review_id"):
+            with connect() as db:
+                db.execute("UPDATE order_reviews SET status='cancelled' WHERE id=? AND customer_id=? AND status='pending'", (pending["review_id"], customer_id))
+        direct_reply = "Cancelled the order review. No order was placed and no payment was taken. Your cart items remain available if you want to try again."
     if action["action"] == "place_order":
         if re.search(r"\b(?:another|a new|one more)\s+order\b", payload.message, re.IGNORECASE):
             context["new_order_requested"] = True
@@ -615,32 +788,30 @@ def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | N
         else:
             quantity_match = re.search(r"\b(?:quantity|qty)\s*(\d{1,2})\b", payload.message, re.IGNORECASE)
             quantity = max(1, min(100, int(quantity_match.group(1)))) if quantity_match else 1
-            existing_id = context.get("last_order_id")
-            existing = None
-            if existing_id and context.get("last_order_product_id") == selected_product["id"] and not context.get("new_order_requested") and not re.search(r"\b(?:another|new|one more)\b", payload.message, re.IGNORECASE):
+            prior_order = None
+            if context.get("last_order_id") and context.get("last_order_product_id") == selected_product["id"] and not context.get("new_order_requested"):
                 with connect() as db:
-                    existing = db.execute("SELECT status FROM orders WHERE id=?", (existing_id,)).fetchone()
-            if existing and existing["status"] in {"pending_confirmation", "pending_approval", "confirmed"}:
-                order_id = existing_id
-                existing_label = "confirmed" if existing["status"] == "confirmed" else "still awaiting salesperson confirmation"
-                direct_reply = f"You already have an order request for {selected_product['name']} ({existing_label}). I haven’t created a duplicate. Reference: {order_id[:8]}."
-                action.update({"action": "order_existing", "order_id": order_id, "product": selected_product, "quantity": quantity})
+                    prior_order = db.execute("SELECT id,status FROM orders WHERE id=? AND customer_id=?", (context["last_order_id"], customer_id)).fetchone()
+            if prior_order and prior_order["status"] in {"pending_confirmation", "pending_approval", "confirmed"}:
+                direct_reply = f"You already have a {prior_order['status'].replace('_',' ')} order for {selected_product['name']} (reference {prior_order['id'][:8]}). Say ‘place another order’ if you mean a new purchase."
+                action = {"action": "order_existing", "order_id": prior_order["id"], "product": selected_product, "reason": "Prevented a duplicate order request."}
+            elif context.get("pending_order_review"):
+                direct_reply = "There is already an order summary waiting for your decision. Reply ‘confirm order’ to send that request, or ‘cancel order’ before starting another."
+                action = {"action": "order_review_pending", "reason": "An order review is already awaiting customer confirmation."}
             else:
-                order_id, stamp = str(uuid4()), now()
-                with connect() as db:
-                    db.execute(
-                        "INSERT INTO orders(id,customer_id,product_id,quantity,status,payment_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                        (order_id, customer_id, selected_product["id"], quantity, "pending_confirmation", "not_paid", stamp, stamp),
-                    )
-                context["last_order_id"] = order_id
-                context["last_order_product_id"] = selected_product["id"]
-                context["last_order_status"] = "pending_confirmation"
-                context.pop("new_order_requested", None)
-                stage = "order_pending_confirmation"
-                action.update({"action": "order_created", "order_id": order_id, "product": selected_product, "quantity": quantity})
-                price = f"PKR {int(selected_product['price']):,}" if selected_product.get("price") is not None else "price to be confirmed"
-                direct_reply = (f"I’ve recorded your order request for {selected_product['name']} × {quantity} ({price}). "
-                                f"It’s awaiting salesperson confirmation; no payment has been taken. Order reference: {order_id[:8]}.")
+                try:
+                    with connect() as db:
+                        review = prepare_order_review(db, customer_id, [{"product_id": selected_product["id"], "quantity": quantity}])
+                    context["pending_order_review"] = review
+                    context.pop("new_order_requested", None)
+                    item = review["items"][0]
+                    action = {"action": "order_review", "review_id": review["review_id"], "items": review["items"], "subtotal": review["subtotal"], "currency": review["currency"]}
+                    direct_reply = (f"Please review your order request:\n• {item['name']} — {quantity} × {item['currency']} {item['unit_price']:,.0f} = {item['currency']} {item['line_total']:,.0f}\n"
+                                    f"Subtotal and total: {review['currency']} {review['subtotal']:,.0f}. Delivery/tax are not included because they haven’t been verified.\n"
+                                    "Reply ‘confirm order’ to send this request to sales, or ‘cancel order’. No order or payment has been created yet.")
+                except HTTPException as error:
+                    direct_reply = error.detail
+                    action = {"action": "order_review_failed", "reason": error.detail}
             context.pop("awaiting_field", None)
     handoff = action["action"] in {"human_handoff", "payment_help"} or human_requested_this_turn
     if handoff:
@@ -663,6 +834,7 @@ def send_message(customer_id: str, payload: MessageIn, x_customer_token: str | N
             "UPDATE customers SET context_json=?, sales_stage=?, handoff_requested=? WHERE id=?",
             (json.dumps(context), stage, int(handoff or row["handoff_requested"]), customer_id),
         )
+        update_customer_lead(db, customer_id, context, now())
     return ConversationReply(customer_id=customer_id, reply=reply, sales_stage=stage, context=context, next_action=action, handoff_required=bool(handoff or row["handoff_requested"]))
 
 
@@ -678,18 +850,62 @@ def conversation_history(customer_id: str) -> dict:
 def sales_handoffs(staff: dict = Depends(require_salesperson)) -> dict:
     with connect() as db:
         rows = db.execute(
-            """SELECT c.*, (SELECT content FROM messages m WHERE m.customer_id=c.id
+            """SELECT c.*, l.id AS lead_id,l.score AS lead_score,l.priority AS lead_priority,l.qualification_reason AS qualification_reason,
+                   (SELECT content FROM messages m WHERE m.customer_id=c.id
                    ORDER BY m.created_at DESC LIMIT 1) AS last_message,
                    (SELECT created_at FROM messages m WHERE m.customer_id=c.id
                    ORDER BY m.created_at DESC LIMIT 1) AS last_message_at
-               FROM customers c WHERE c.handoff_requested=1
+               FROM customers c LEFT JOIN leads l ON l.customer_id=c.id WHERE c.handoff_requested=1
                ORDER BY COALESCE(last_message_at,c.created_at) DESC"""
         ).fetchall()
     return {"handoffs": [
         {"customer": customer_from_row(row).model_dump(), "last_message": row["last_message"],
-         "last_message_at": row["last_message_at"]}
+         "last_message_at": row["last_message_at"], "lead": {"id": row["lead_id"], "score": row["lead_score"],
+         "priority": row["lead_priority"], "qualification_reason": row["qualification_reason"]} if row["lead_id"] else None}
         for row in rows
     ]}
+
+
+@app.get("/api/v1/sales/leads")
+def sales_leads(status: str | None = None, priority: str | None = None, q: str | None = None, staff: dict = Depends(require_salesperson)) -> list[dict]:
+    clauses, values = [], []
+    if status:
+        if status not in {"new", "qualifying", "qualified", "nurture", "converted", "lost"}:
+            raise HTTPException(status_code=422, detail="Invalid lead status")
+        clauses.append("l.status=?"); values.append(status)
+    if priority:
+        if priority not in {"low", "medium", "high"}:
+            raise HTTPException(status_code=422, detail="Invalid priority")
+        clauses.append("l.priority=?"); values.append(priority)
+    if q:
+        clauses.append("(c.name LIKE ? OR c.contact LIKE ? OR c.id LIKE ? OR c.context_json LIKE ?)")
+        values.extend([f"%{q}%"] * 4)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connect() as db:
+        rows = db.execute("""SELECT l.*,c.name,c.contact,c.channel,c.sales_stage,c.context_json,
+            (SELECT content FROM messages m WHERE m.customer_id=c.id AND m.role='customer' ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+            (SELECT created_at FROM messages m WHERE m.customer_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_interaction
+            FROM leads l JOIN customers c ON c.id=l.customer_id""" + where + " ORDER BY CASE l.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,l.updated_at DESC", values).fetchall()
+    return [{**dict(row), "context": decode_context(row["context_json"])} for row in rows]
+
+
+@app.patch("/api/v1/sales/leads/{lead_id}")
+def update_sales_lead(lead_id: str, payload: LeadUpdate, staff: dict = Depends(require_salesperson)) -> dict:
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide at least one lead update")
+    if any(changes.get(field) is None for field in ("status", "priority") if field in changes):
+        raise HTTPException(status_code=422, detail="Lead status and priority cannot be null")
+    with connect() as db:
+        lead = db.execute("SELECT id FROM leads WHERE id=?", (lead_id,)).fetchone()
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        fields = ",".join(f"{key}=?" for key in changes)
+        override = ",qualification_overridden=1" if "status" in changes else ""
+        priority_override = ",priority_overridden=1" if "priority" in changes else ""
+        db.execute(f"UPDATE leads SET {fields}{override}{priority_override},updated_by_user_id=?,updated_at=? WHERE id=?", [*changes.values(), staff["id"], now(), lead_id])
+        updated = db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+    return dict(updated)
 
 
 @app.post("/api/v1/sales/{customer_id}/messages")
@@ -747,23 +963,25 @@ def request_handoff(customer_id: str, reason: str = "Salesperson assistance requ
 @app.post("/api/v1/appointments/{customer_id}", status_code=201)
 def request_appointment(customer_id: str, payload: AppointmentCreate) -> dict:
     get_customer_row(customer_id)
-    appointment_id = str(uuid4())
     with connect() as db:
+        existing = db.execute("SELECT id,status FROM appointments WHERE customer_id=? AND requested_time=? AND status IN ('requested','confirmed') ORDER BY created_at DESC LIMIT 1", (customer_id, payload.requested_time)).fetchone()
+        if existing:
+            return {"id": existing["id"], "customer_id": customer_id, "requested_time": payload.requested_time, "status": existing["status"], "duplicate": True}
+        appointment_id = str(uuid4())
         db.execute("INSERT INTO appointments(id,customer_id,requested_time,notes,created_at) VALUES(?,?,?,?,?)", (appointment_id, customer_id, payload.requested_time, payload.notes, now()))
-    return {"id": appointment_id, "customer_id": customer_id, "requested_time": payload.requested_time, "status": "requested"}
+    return {"id": appointment_id, "customer_id": customer_id, "requested_time": payload.requested_time, "status": "requested", "duplicate": False}
 
 
 @app.post("/api/v1/orders/{customer_id}", status_code=201)
-def create_order(customer_id: str, payload: OrderCreate) -> dict:
+def create_order(customer_id: str, payload: OrderCreate, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
-    order_id = str(uuid4())
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
         product = db.execute("SELECT id,name FROM products WHERE id=? AND active=1", (payload.product_id,)).fetchone()
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
-        stamp = now()
-        db.execute("INSERT INTO orders(id,customer_id,product_id,quantity,status,payment_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (order_id, customer_id, payload.product_id, payload.quantity, "pending_confirmation", "not_paid", stamp, stamp))
-    return {"id": order_id, "customer_id": customer_id, "product": product["name"], "quantity": payload.quantity, "status": "pending_confirmation", "payment_status": "not_paid", "message": "Order request recorded for salesperson confirmation. No payment has been taken."}
+        review = prepare_order_review(db, customer_id, [{"product_id": payload.product_id, "quantity": payload.quantity}])
+    return {**review, "message": "Review this summary and explicitly confirm it before an order request is created."}
 
 
 def cart_snapshot(db, customer_id: str) -> dict:
@@ -779,16 +997,19 @@ def cart_snapshot(db, customer_id: str) -> dict:
 
 
 @app.get("/api/v1/carts/{customer_id}")
-def get_cart(customer_id: str) -> dict:
+def get_cart(customer_id: str, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
         return cart_snapshot(db, customer_id)
 
 
 @app.post("/api/v1/carts/{customer_id}/items")
-def add_cart_item(customer_id: str, payload: CartItemCreate) -> dict:
+def add_cart_item(customer_id: str, payload: CartItemCreate, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
+        db.execute("UPDATE order_reviews SET status='invalidated' WHERE customer_id=? AND source='cart' AND status='pending'", (customer_id,))
         if not db.execute("SELECT id FROM products WHERE id=? AND active=1", (payload.product_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Product not found")
         current = db.execute("SELECT quantity FROM cart_items WHERE customer_id=? AND product_id=?", (customer_id, payload.product_id)).fetchone()
@@ -800,9 +1021,11 @@ def add_cart_item(customer_id: str, payload: CartItemCreate) -> dict:
 
 
 @app.patch("/api/v1/carts/{customer_id}/items/{product_id}")
-def update_cart_item(customer_id: str, product_id: str, payload: CartItemUpdate) -> dict:
+def update_cart_item(customer_id: str, product_id: str, payload: CartItemUpdate, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
+        db.execute("UPDATE order_reviews SET status='invalidated' WHERE customer_id=? AND source='cart' AND status='pending'", (customer_id,))
         result = db.execute("UPDATE cart_items SET quantity=?,updated_at=? WHERE customer_id=? AND product_id=?", (payload.quantity, now(), customer_id, product_id))
         if not result.rowcount:
             raise HTTPException(status_code=404, detail="Cart item not found")
@@ -810,32 +1033,46 @@ def update_cart_item(customer_id: str, product_id: str, payload: CartItemUpdate)
 
 
 @app.delete("/api/v1/carts/{customer_id}/items/{product_id}")
-def delete_cart_item(customer_id: str, product_id: str) -> dict:
+def delete_cart_item(customer_id: str, product_id: str, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
+        db.execute("UPDATE order_reviews SET status='invalidated' WHERE customer_id=? AND source='cart' AND status='pending'", (customer_id,))
         db.execute("DELETE FROM cart_items WHERE customer_id=? AND product_id=?", (customer_id, product_id))
         return cart_snapshot(db, customer_id)
 
 
 @app.post("/api/v1/carts/{customer_id}/checkout", status_code=201)
-def checkout_cart(customer_id: str, payload: CheckoutCreate) -> dict:
+def checkout_cart(customer_id: str, payload: CheckoutCreate, x_customer_token: str | None = Header(default=None)) -> dict:
     get_customer_row(customer_id)
-    checkout_id = str(uuid4())
-    stamp = now()
+    verify_customer_token(customer_id, x_customer_token)
     with connect() as db:
         cart = cart_snapshot(db, customer_id)
         if not cart["items"]:
             raise HTTPException(status_code=400, detail="Your cart is empty")
-        for item in cart["items"]:
-            db.execute("INSERT INTO orders(id,checkout_id,customer_id,product_id,quantity,status,payment_status,payment_method,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       (str(uuid4()), checkout_id, customer_id, item["product_id"], item["quantity"], "pending_confirmation", "not_paid", payload.payment_method, stamp, stamp))
-        db.execute("DELETE FROM cart_items WHERE customer_id=?", (customer_id,))
-        if payload.payment_method == "bank_transfer":
-            customer = db.execute("SELECT context_json FROM customers WHERE id=?", (customer_id,)).fetchone()
-            context = decode_context(customer["context_json"])
-            context["handoff_reason"] = "Customer requested bank transfer checkout; share verified payment instructions after confirming the order."
-            db.execute("UPDATE customers SET handoff_requested=1,sales_stage='human_handoff',context_json=? WHERE id=?", (json.dumps(context), customer_id))
-    return {"checkout_id": checkout_id, "customer_id": customer_id, "items": cart["items"], "subtotal": cart["subtotal"], "currency": cart["currency"], "payment_method": payload.payment_method, "payment_status": "not_paid", "status": "pending_confirmation", "message": "Order request recorded. Payment has not been taken. A salesperson will confirm availability and share bank transfer instructions if selected."}
+        return prepare_order_review(db, customer_id, cart["items"], payload.payment_method, source="cart")
+
+
+@app.post("/api/v1/order-reviews/{review_id}/confirm")
+def confirm_review_endpoint(review_id: str, customer_id: str, x_customer_token: str | None = Header(default=None)) -> dict:
+    verify_customer_token(customer_id, x_customer_token)
+    with connect() as db:
+        result = confirm_order_review(db, customer_id, review_id)
+    if result.get("error"):
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@app.post("/api/v1/order-reviews/{review_id}/cancel")
+def cancel_review_endpoint(review_id: str, customer_id: str, x_customer_token: str | None = Header(default=None)) -> dict:
+    verify_customer_token(customer_id, x_customer_token)
+    with connect() as db:
+        review = db.execute("SELECT status FROM order_reviews WHERE id=? AND customer_id=?", (review_id, customer_id)).fetchone()
+        if not review:
+            raise HTTPException(status_code=404, detail="Order review not found")
+        if review["status"] == "pending":
+            db.execute("UPDATE order_reviews SET status='cancelled' WHERE id=?", (review_id,))
+        return {"review_id": review_id, "status": "cancelled" if review["status"] == "pending" else review["status"]}
 
 
 @app.get("/api/v1/admin/summary")
@@ -896,6 +1133,19 @@ def update_admin_order(order_id: str, payload: AdminOrderUpdate, staff: dict = D
         exists = db.execute("SELECT status,payment_status,fulfillment_status,customer_id,product_id FROM orders WHERE id=?", (order_id,)).fetchone()
         if not exists:
             raise HTTPException(status_code=404, detail="Order not found")
+        status_transitions = {"pending_confirmation": {"confirmed", "cancelled"}, "pending_approval": {"confirmed", "cancelled"}, "confirmed": {"cancelled"}, "cancelled": set()}
+        payment_transitions = {"not_paid": {"paid"}, "paid": {"refunded"}, "refunded": set()}
+        fulfillment_transitions = {"not_started": {"processing", "shipped"}, "processing": {"shipped"}, "shipped": {"delivered"}, "delivered": {"returned"}, "returned": set()}
+        if "status" in changes and changes["status"] != exists["status"] and changes["status"] not in status_transitions.get(exists["status"], set()):
+            raise HTTPException(status_code=409, detail=f"Order cannot move from {exists['status']} to {changes['status']}")
+        if "payment_status" in changes and changes["payment_status"] != exists["payment_status"] and changes["payment_status"] not in payment_transitions.get(exists["payment_status"], set()):
+            raise HTTPException(status_code=409, detail=f"Payment cannot move from {exists['payment_status']} to {changes['payment_status']}")
+        if changes.get("payment_status") in {"paid", "refunded"} and exists["status"] != "confirmed":
+            raise HTTPException(status_code=409, detail="Confirm the order before recording payment or a refund")
+        if "fulfillment_status" in changes and changes["fulfillment_status"] != exists["fulfillment_status"] and changes["fulfillment_status"] not in fulfillment_transitions.get(exists["fulfillment_status"], set()):
+            raise HTTPException(status_code=409, detail=f"Fulfillment cannot move from {exists['fulfillment_status']} to {changes['fulfillment_status']}")
+        if changes.get("fulfillment_status") and exists["status"] != "confirmed":
+            raise HTTPException(status_code=409, detail="Confirm the order before updating fulfillment")
         assignments = []
         values = []
         for field, value in changes.items():

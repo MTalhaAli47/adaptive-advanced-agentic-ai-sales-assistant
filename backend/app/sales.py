@@ -62,6 +62,8 @@ def _category(text: str) -> str | None:
         return None
     if _requests_appointment(text):
         return None
+    if re.fullmatch(r"\s*(?:i need\s+|i want\s+|at least\s+)?(?:\d{1,3}\s*gb\s*(?:ram|memory|vram|ssd|storage)|rtx\s*\d{4}(?:\s*ti)?)(?:\s+(?:please|minimum))?[.!\s]*", text, re.IGNORECASE):
+        return None
     request = re.search(
         r"\b(?:i need|i want|looking for|search for|do you have|do you sell|sell me|show me|recommend(?: me)?|looking to buy|buy)\s+(?:a|an|some|any|the)?\s*([a-z0-9][a-z0-9 -]{1,48})",
         text,
@@ -98,6 +100,7 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
         context.pop("gpu_model", None)
         context.pop("minimum_ram_gb", None)
         context.pop("minimum_vram_gb", None)
+        context.pop("minimum_storage_gb", None)
         context.pop("result_limit", None)
         context.pop("price_order", None)
         context.pop("last_recommended_product_ids", None)
@@ -154,6 +157,11 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
     vram = re.search(r"\b(?:at least|min(?:imum)?)?\s*(\d{1,2})\s*gb\s*vram\b", lowered)
     if vram:
         context["minimum_vram_gb"] = int(vram.group(1))
+    storage = re.search(r"\b(?:at least|min(?:imum)?)?\s*(\d{2,5})\s*gb\s*(?:ssd|storage)\b", lowered)
+    if storage:
+        context["minimum_storage_gb"] = int(storage.group(1))
+    if (gpu or ram or vram or storage) and context.get("awaiting_field") == "budget":
+        context.pop("awaiting_field", None)
 
     if any(term in lowered for term in ("gaming", "game", "3d", "render", "ai work", "machine learning")):
         context["use_case"] = "gaming and 3D/AI workloads"
@@ -165,7 +173,10 @@ def extract_context(message: str, context: dict[str, Any]) -> dict[str, Any]:
             context.pop("awaiting_field", None)
 
     budget_text = re.sub(r"\blakg\b", "lakh", text, flags=re.IGNORECASE)
-    budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram)\b", " ", budget_text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\balkh\b", "lakh", budget_text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\bhalf\s+(?:a\s+)?million\b", "500000", budget_text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\bquarter\s+(?:of\s+)?(?:a\s+)?million\b", "250000", budget_text, flags=re.IGNORECASE)
+    budget_text = re.sub(r"\b\d+\s*gb\s*(?:ram|memory|vram|ssd|storage)\b", " ", budget_text, flags=re.IGNORECASE)
     budget_text = re.sub(r"\brtx\s*(?:5060|5070\s*ti|5070|5080|5090)\b", " ", budget_text, flags=re.IGNORECASE)
     budget_text = re.sub(
         r"\b(?:show|give|list)\s+(?:me\s+)?(?:only\s+)?(?:\d{1,2}|one|two|three|four|five)\s+(?:\w+\s+)?(?:products?|items?|laptops?|options?|results?)\b",
@@ -265,6 +276,8 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
     lowered = message.casefold()
     if _requests_human(lowered):
         return {"action": "human_handoff", "reason": "Customer requested a person.", "requires_approval": False}
+    if context.get("pending_order_review") and re.fullmatch(r"\s*(?:yes(?: place order)?|yeah|yep|please confirm(?: the order)?|confirm(?: the order)?|place it|place the order|looks good|that's correct|that is correct|correct)\s*[.!]*\s*", lowered):
+        return {"action": "confirm_order_review", "reason": "Customer explicitly confirmed the current order review."}
     if CONFIRM_RE.search(lowered) or re.search(r"\b(?:confirm|verify)\b", lowered):
         return {"action": "human_handoff", "reason": "Customer asked a salesperson to confirm availability or order details.", "requires_approval": False}
     if _requests_payment(lowered):
@@ -300,6 +313,12 @@ def choose_next_action(context: dict[str, Any], stage: str, message: str) -> dic
         }
     if THANKS_RE.search(lowered):
         return {"action": "smalltalk", "reason": "Acknowledge the customer and keep their order context."}
+
+    if context.get("pending_order_review"):
+        if re.search(r"\b(?:cancel|never mind|nevermind|don't place|do not place)\b", lowered):
+            return {"action": "cancel_order_review", "reason": "Customer cancelled the pending order review."}
+        if re.fullmatch(r"\s*(?:yes(?: place order)?|yeah|yep|please confirm(?: the order)?|confirm(?: the order)?|place it|place the order|looks good|that's correct|that is correct|correct)\s*[.!]*\s*", lowered):
+            return {"action": "confirm_order_review", "reason": "Customer explicitly confirmed the current order review."}
 
     category = context.get("product_category")
     if context.get("awaiting_field") == "product_selection":

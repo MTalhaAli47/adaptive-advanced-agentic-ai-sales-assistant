@@ -115,6 +115,37 @@ def initialize_database() -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(customer_id, product_id)
             );
+            CREATE TABLE IF NOT EXISTS order_reviews (
+                id TEXT PRIMARY KEY,
+                customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+                items_json TEXT NOT NULL,
+                subtotal REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'PKR',
+                payment_method TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'chat',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','cancelled','invalidated')),
+                checkout_id TEXT,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_reviews_customer ON order_reviews(customer_id,created_at);
+            CREATE TABLE IF NOT EXISTS leads (
+                id TEXT PRIMARY KEY,
+                customer_id TEXT NOT NULL UNIQUE REFERENCES customers(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','qualifying','qualified','nurture','converted','lost')),
+                qualification_overridden INTEGER NOT NULL DEFAULT 0,
+                priority_overridden INTEGER NOT NULL DEFAULT 0,
+                score INTEGER NOT NULL DEFAULT 0 CHECK(score BETWEEN 0 AND 100),
+                priority TEXT NOT NULL DEFAULT 'low' CHECK(priority IN ('low','medium','high')),
+                qualification_reason TEXT NOT NULL DEFAULT '',
+                assigned_to TEXT,
+                notes TEXT NOT NULL DEFAULT '',
+                follow_up_at TEXT,
+                updated_by_user_id TEXT,
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_leads_priority ON leads(priority,status,updated_at);
             CREATE TABLE IF NOT EXISTS product_relationships (
                 id TEXT PRIMARY KEY,
                 main_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
@@ -162,6 +193,16 @@ def initialize_database() -> None:
         appointment_columns = {row["name"] for row in db.execute("PRAGMA table_info(appointments)").fetchall()}
         if "updated_by_user_id" not in appointment_columns:
             db.execute("ALTER TABLE appointments ADD COLUMN updated_by_user_id TEXT")
+        review_columns = {row["name"] for row in db.execute("PRAGMA table_info(order_reviews)").fetchall()}
+        if "source" not in review_columns:
+            db.execute("ALTER TABLE order_reviews ADD COLUMN source TEXT NOT NULL DEFAULT 'chat'")
+        lead_columns = {row["name"] for row in db.execute("PRAGMA table_info(leads)").fetchall()}
+        if "updated_by_user_id" not in lead_columns:
+            db.execute("ALTER TABLE leads ADD COLUMN updated_by_user_id TEXT")
+        if "qualification_overridden" not in lead_columns:
+            db.execute("ALTER TABLE leads ADD COLUMN qualification_overridden INTEGER NOT NULL DEFAULT 0")
+        if "priority_overridden" not in lead_columns:
+            db.execute("ALTER TABLE leads ADD COLUMN priority_overridden INTEGER NOT NULL DEFAULT 0")
         existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
         for column, definition in (
             ("brand", "TEXT"), ("ram_gb", "INTEGER"), ("gpu_model", "TEXT"),

@@ -11,6 +11,7 @@
     #handoffs:empty:after{content:'No customers are waiting for a salesperson.';display:block;color:#6b7486;padding:8px 0}
     .handoff-lead{border-left:4px solid #e99a28}.conversation{height:360px;overflow:auto;background:#f8f9fc;border:1px solid #e4e8f0;border-radius:12px;padding:12px}.bubble.salesperson{background:#e9f8ef;border:1px solid #bee6c9}
     .sales-reply{display:flex;gap:10px;margin-top:10px}.sales-reply input{flex:1;min-width:0;padding:12px;border:1px solid #d9dfeb;border-radius:10px;font:inherit}
+    #leads .lead select,#leads .lead input,#leads .lead textarea{display:block;width:100%;margin:4px 0 9px;padding:8px;border:1px solid #d9dfeb;border-radius:8px;font:inherit;background:#fff}#leads .lead textarea{min-height:58px;resize:vertical}
     .context-panel{margin:18px 0 22px;padding:20px;background:linear-gradient(145deg,#f7f9ff,#fff);border:1px solid #e3e9f5;border-radius:18px}.context-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}.context-heading h3{margin:0}.context-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.context-card{min-width:0;padding:15px 16px;background:#fff;border:1px solid #e8edf5;border-radius:13px}.context-card.wide{grid-column:1/-1}.context-label{display:block;margin-bottom:7px;color:#69758a;font-size:12px;font-weight:750;letter-spacing:.055em;text-transform:uppercase}.context-value{font-size:15px;line-height:1.55;overflow-wrap:anywhere}.context-chips{display:flex;flex-wrap:wrap;gap:7px}.context-chip{padding:5px 9px;border-radius:999px;background:#eef2fb;color:#33466d;font-size:13px}.context-chip.good{background:#e9f8ef;color:#19613a}.context-chip.warn{background:#fff4df;color:#81540a}.context-empty{color:#778196}.context-debug{margin-top:14px;border-top:1px solid #e5eaf2;padding-top:11px}.context-debug summary{cursor:pointer;color:#647089;font-size:13px}.context-debug pre{max-height:240px;overflow:auto;padding:12px;background:#f4f6fa;border-radius:10px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}.next-action{padding:14px 16px;border-left:4px solid #3159c9;background:#f3f6ff;border-radius:0 12px 12px 0}
     @media(max-width:760px){.sales-columns{grid-template-columns:1fr}}
   </style>
@@ -23,7 +24,7 @@
     <div class="sales-columns">
       <aside class="side-panels">
         <section class="panel"><h2>HandOffs</h2><div id="handoffs"></div></section>
-        <section class="panel"><h2>Conversations</h2><div id="leads">Loading…</div></section>
+        <section class="panel"><h2>Potential Customers / Leads</h2><p class="muted">Ranked using details customers actually shared. Missing facts stay marked unknown.</p><input id="lead-search" class="field" placeholder="Search name, contact, or interest"><div style="display:flex;gap:8px;margin:8px 0"><select id="lead-status-filter" class="field"><option value="">All statuses</option><option>new</option><option>qualifying</option><option>qualified</option><option>nurture</option><option>converted</option><option>lost</option></select><select id="lead-priority-filter" class="field"><option value="">All priorities</option><option>high</option><option>medium</option><option>low</option></select></div><div id="leads">Loading…</div></section>
       </aside>
       <section class="panel" id="detail"><p class="muted">Select a conversation to review its context and history.</p></section>
     </div>
@@ -34,20 +35,26 @@ const rawFetch=globalThis.fetch.bind(globalThis);let salesLoginPrompt;
 async function salesFetch(url,options={}){const protectedCall=String(url).includes('/api/v1/sales/')||String(url).includes('/api/v1/dashboard/summary');let requestOptions=options;const cached=sessionStorage.getItem('aisa_sales_auth');if(protectedCall&&cached){const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${cached}`);requestOptions={...options,headers}}let response=await rawFetch(url,requestOptions);if(response.status!==401||!protectedCall)return response;if(!salesLoginPrompt)salesLoginPrompt=(async()=>{const login=sessionStorage.getItem('aisa_sales_login')||prompt('Salesperson login ID');const password=prompt('Salesperson password');if(!login||!password)return null;const value=btoa(`${login}:${password}`);sessionStorage.setItem('aisa_sales_login',login);sessionStorage.setItem('aisa_sales_auth',value);return value})();const auth=await salesLoginPrompt;if(!auth)return response;const headers=new Headers(options.headers||{});headers.set('Authorization',`Basic ${auth}`);response=await rawFetch(url,{...options,headers});if(response.status===401){sessionStorage.removeItem('aisa_sales_auth');salesLoginPrompt=null}return response}
 globalThis.fetch=salesFetch;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let data=[],selectedId=null;
+let data=[],leadData=[],selectedId=null;
 async function load(){
-  const [w,s,p,h]=await Promise.all([
+  const [w,s,p,h,l]=await Promise.all([
     fetch('/api/v1/sales/workspace').then(r=>r.json()),fetch('/api/v1/dashboard/summary').then(r=>r.json()),
-    fetch('/api/v1/products').then(r=>r.json()),fetch('/api/v1/sales/handoffs').then(r=>r.json())
+    fetch('/api/v1/products').then(r=>r.json()),fetch('/api/v1/sales/handoffs').then(r=>r.json()),fetch('/api/v1/sales/leads').then(r=>r.json())
   ]);
-  data=w.conversations;
+  data=w.conversations;leadData=l;
   if(w.staff)document.querySelector('#staff-identity').textContent=`Salesperson ID: ${w.staff.id} · Login: ${w.staff.login_id}`;
   document.querySelector('#stats').innerHTML=[['Leads',s.leads],['Human handoffs',s.handoffs],['Appointments to confirm',s.appointments_to_confirm],['Orders awaiting approval',s.orders_pending_approval]].map(x=>`<article class="card"><span class="muted">${x[0]}</span><div class="stat">${x[1]}</div></article>`).join('');
-  document.querySelector('#handoffs').innerHTML=h.handoffs.map(x=>{const c=x.customer;return `<button class="lead handoff-lead" onclick="showLead('${esc(c.id)}')"><strong>${esc(c.name)}</strong><br><span class="tag">Waiting for you</span><br><small class="muted">${esc(x.last_message||'Customer requested a salesperson')}</small></button>`}).join('');
-  document.querySelector('#leads').innerHTML=data.length?data.map(x=>`<button class="lead" onclick="showLead('${esc(x.customer.id)}')"><strong>${esc(x.customer.name)}</strong><br><span class="tag">${esc(x.customer.channel)}</span> <span class="tag">${esc(x.customer.sales_stage)}</span><br><small class="muted">${esc(x.last_message?.content||'No messages yet')}</small></button>`).join(''):'<p class="muted">No conversations yet. Start a customer conversation to see it here.</p>';
+  document.querySelector('#handoffs').innerHTML=h.handoffs.map(x=>{const c=x.customer;return `<button class="lead handoff-lead" onclick="showLead('${esc(c.id)}')"><strong>${esc(c.name)}</strong><br><span class="tag">Waiting for you</span> ${x.lead?.priority?`<span class="tag">${esc(x.lead.priority)} priority · ${Number(x.lead.score||0)}/100</span>`:''}<br><small class="muted">${esc(c.context?.handoff_reason||x.last_message||'Customer requested a salesperson')}</small><br><small>${esc(x.lead?.qualification_reason||'Review customer context and conversation.')}</small></button>`}).join('');
+  renderPotentialCustomers();
   document.querySelector('#products').innerHTML=p.map(x=>`<div class="product"><strong>${esc(x.name)}</strong><span>${x.price==null?'Price on request':esc(x.currency)+' '+Number(x.price).toLocaleString()}</span></div>`).join('');
   if(selectedId){const draft=document.querySelector('#sales-reply input')?.value||'';await showLead(selectedId);const input=document.querySelector('#sales-reply input');if(input)input.value=draft}
 }
+function renderPotentialCustomers(){
+  const q=document.querySelector('#lead-search').value.trim().toLowerCase(),status=document.querySelector('#lead-status-filter').value,priority=document.querySelector('#lead-priority-filter').value;
+  const items=leadData.filter(x=>(!q||`${x.name} ${x.contact||''} ${x.context.product_category||''} ${x.context.need||''}`.toLowerCase().includes(q))&&(!status||x.status===status)&&(!priority||x.priority===priority));
+  document.querySelector('#leads').innerHTML=items.length?items.map(x=>`<article class="lead"><button class="lead" onclick="showLead('${esc(x.customer_id)}')" style="text-align:left;width:100%"><strong>${esc(x.name)}</strong> <span class="tag">${esc(x.priority)} priority · ${x.score}/100</span><br><span class="tag">${esc(x.status)}</span> <span class="tag">${esc(x.context.product_category||'Interest not captured')}</span><br><small>${esc(x.qualification_reason)}</small><br><small class="muted">${esc(x.last_message||'No customer message yet')}</small></button><label class="muted">Status <select onchange="updateLead('${esc(x.id)}',{status:this.value})">${['new','qualifying','qualified','nurture','converted','lost'].map(s=>`<option value="${s}" ${s===x.status?'selected':''}>${s}</option>`).join('')}</select></label><label class="muted">Priority <select onchange="updateLead('${esc(x.id)}',{priority:this.value})">${['high','medium','low'].map(s=>`<option value="${s}" ${s===x.priority?'selected':''}>${s}</option>`).join('')}</select></label><label class="muted">Assigned salesperson <input value="${esc(x.assigned_to||'')}" placeholder="Unassigned" onchange="updateLead('${esc(x.id)}',{assigned_to:this.value||null})"></label><label class="muted">Next follow-up <input type="datetime-local" value="${esc((x.follow_up_at||'').slice(0,16))}" onchange="updateLead('${esc(x.id)}',{follow_up_at:this.value||null})"></label><label class="muted">Sales notes <textarea maxlength="4000" placeholder="Add a note" onchange="updateLead('${esc(x.id)}',{notes:this.value})">${esc(x.notes||'')}</textarea></label></article>`).join(''):'<p class="muted">No potential customers match these filters yet. Product inquiries are saved as leads as the conversation progresses.</p>';
+}
+async function updateLead(id,changes){const response=await fetch(`/api/v1/sales/leads/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});if(!response.ok){alert('Lead update failed');return}await load()}
 async function showLead(id){
   selectedId=id;const item=data.find(x=>x.customer.id===id);if(!item)return;
   const c=item.customer,detail=document.querySelector('#detail');
@@ -73,7 +80,7 @@ function renderCustomerContext(c){
 }
 async function handoff(id){await fetch(`/api/v1/sales/${encodeURIComponent(id)}/handoff`,{method:'POST'});await load();showLead(id)}
 async function resolveHandoff(id){await fetch(`/api/v1/sales/${encodeURIComponent(id)}/handoff/resolve`,{method:'POST'});await load()}
-load();setInterval(load,10000);
+document.querySelector('#lead-search').addEventListener('input',renderPotentialCustomers);document.querySelector('#lead-status-filter').addEventListener('change',renderPotentialCustomers);document.querySelector('#lead-priority-filter').addEventListener('change',renderPotentialCustomers);load();setInterval(load,10000);
 </script>
 </body>
 </html>
